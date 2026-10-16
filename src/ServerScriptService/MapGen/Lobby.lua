@@ -335,7 +335,7 @@ local function addMoonShaft(glass: BasePart, floor: BasePart, side: number)
 	top.Parent = glass
 	local landing = Instance.new("Attachment")
 	landing.Name = "MoonShaftFloor"
-	landing.CFrame = floor.CFrame:ToObjectSpace(C(side * (HALF_X - 15), FLOOR + 0.05, glass.Position.Z))
+	landing.CFrame = floor.CFrame:ToObjectSpace(C(side * (HALF_X - 15), FLOOR + 0.05, glass.CFrame.Position.Z))
 	landing.Parent = floor
 	local beam = Instance.new("Beam")
 	beam.Name = "MoonShaft"

@@ -37,6 +37,8 @@ local InterrogationModule = require(script.Parent.InterrogationModule)
 local Names = require(ReplicatedStorage.Shared.Names)
 local Config = require(ReplicatedStorage.Shared.Config)
 
+local LOCKED_ATTRIBUTE = "Locked"
+
 local MapBuilder = {}
 
 -- Bump whenever the generator output changes so baked maps are replaced.
@@ -105,6 +107,12 @@ function MapBuilder.Build(force: boolean?): Folder
 
 	local existingMap = Workspace:FindFirstChild(Names.Map)
 	local existingTemplate = ServerStorage:FindFirstChild(Names.Template)
+	-- A baked map (MapBuilder.Bake) is yours: never regenerate it on Play, even
+	-- after a generator update. Only an explicit Build(true) / Bake() replaces it.
+	if not force and existingMap and existingTemplate and existingMap:GetAttribute(LOCKED_ATTRIBUTE) == true then
+		existingMap:SetAttribute(Names.MapReadyAttribute, true)
+		return existingMap :: Folder
+	end
 	if not force and existingMap and isCurrent(existingMap, existingTemplate) then
 		existingMap:SetAttribute(Names.MapReadyAttribute, true)
 		return existingMap :: Folder
@@ -127,6 +135,26 @@ function MapBuilder.Build(force: boolean?): Folder
 	end
 	print(`[MapBuilder] map v{MapBuilder.Version} built: {Builder.GetPartCount()} parts in {string.format("%.2f", os.clock() - started)} s`)
 	return result
+end
+
+--[[
+	Bake the map into the place so you can edit it by hand.
+
+	Run ONCE in Studio's Command Bar (View → Command Bar) while NOT playing:
+
+	    require(game.ServerScriptService.MapGen.MapBuilder).Bake()
+
+	Then save the place. Workspace.Map and ServerStorage.InterrogationModuleTemplate
+	stay in the file, Play reuses them as they are, and generator updates never
+	overwrite them (attribute "Locked" = true). Edit the template in
+	ServerStorage to change every interrogation room. Calling Bake() again
+	throws away your edits and regenerates.
+]]
+function MapBuilder.Bake(): Folder
+	local map = MapBuilder.Build(true)
+	map:SetAttribute(LOCKED_ATTRIBUTE, true)
+	print("[MapBuilder] map baked and locked. Save the place (Ctrl+S) to keep it.")
+	return map
 end
 
 return MapBuilder
