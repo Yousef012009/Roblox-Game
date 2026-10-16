@@ -24,6 +24,9 @@
 	│ JudgeAnswer      │ C→S  │ (matchId: string, turnId: number,            │ sender is THIS match's Caller, state is     │
 	│                  │      │  verdict: "Valid"|"Wrong")                   │ JUDGING for that turnId, first verdict wins │
 	│ LeaveQueue       │ C→S  │ ()                                           │ sender is in a queue that is not departing  │
+	│ QueueAction      │ C→S  │ ("SetParty", humans: number, bots: number)   │ sender is the HOST of a queue that is not   │
+	│                  │      │ ("StartNow")                                 │ departing; integers, humans 1..Capacity,    │
+	│                  │      │                                              │ bots 0..Capacity-humans; bots raised to 3 total│
 	│ GetState (RF)    │ C→S  │ () → ClientState                             │ returns only the caller's own data          │
 	└──────────────────┴──────┴──────────────────────────────────────────────┴────────────────────────────────────────────┘
 
@@ -46,6 +49,9 @@ export type QueueStatus = {
 	capacity: number,
 	state: QueueState,
 	startsAt: number?, -- server clock time the doors close (state "Starting")
+	hostUserId: number?, -- first player in the chamber; only they may change the party setup
+	wantedHumans: number, -- humans the host is waiting for (1..capacity)
+	bots: number, -- bots that will join (0..capacity - wantedHumans)
 }
 
 export type MatchState =
@@ -66,11 +72,12 @@ export type PlayerRole = "Caller" | "Answerer"
 export type MatchPlayer = {
 	userId: number,
 	name: string, -- DisplayName
-	seat: number, -- 1..4, clockwise from above (play passes to the LEFT = next seat)
+	seat: number, -- 1..Capacity (8), clockwise from above (play passes to the LEFT = next seat)
 	role: PlayerRole, -- this round
 	status: PlayerStatus, -- this round ("Eliminated" players are in the spectator lounge)
 	roundWins: number,
 	acceptedCount: number, -- accepted answers this match (tie-breaker)
+	isBot: boolean, -- AI detective (bots have negative userIds and no Player)
 }
 
 export type TurnInfo = {
@@ -184,6 +191,7 @@ local Remotes = {
 	SubmitAnswer = get("SubmitAnswer", "RemoteEvent") :: RemoteEvent,
 	JudgeAnswer = get("JudgeAnswer", "RemoteEvent") :: RemoteEvent,
 	LeaveQueue = get("LeaveQueue", "RemoteEvent") :: RemoteEvent,
+	QueueAction = get("QueueAction", "RemoteEvent") :: RemoteEvent,
 
 	-- Client → Server (request/response)
 	GetState = get("GetState", "RemoteFunction") :: RemoteFunction,

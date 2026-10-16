@@ -9,22 +9,29 @@
 	Module-local coordinates (the template's pivot = ModuleRoot = origin):
 
 	        Z = -12 ┌──────── interrogation room ────────┬── lounge ──┐
-	                │ TV on X = -14   [01]               │  desk/CRTs │
-	                │            [04] TABLE [02]    mirror  ->  spawns │
-	                │                 [03]     X = 14.5  │  railing   │
+	                │ TV      [01]  [02]  [03]           │  desk/CRTs │
+	                │ [08] ════════ TABLE ════════ [04]  │ R  01  05  │
+	                │         [07]  [06]  [05]   mirror  │ R  ..  ..  │
+	                │                            X=14.5  │ R  04  08  │
 	        Z = +12 └──────────── door (X 6) ────────────┴────────────┘
 	              X = -14                            X = 14  15      29
+	        (R = guard rail; spectator spawns face -X toward the mirror)
 
 	  room interior    X ∈ [-14, 14], Z ∈ [-12, 12], Y ∈ [0.2, 14.2]
 	  mirror opening   X = 14.5, Z ∈ [-9, 9], Y ∈ [3, 11] (glass, collidable)
 	  lounge interior  X ∈ [15, 29], Z ∈ [-12, 12], Y ∈ [0.2, 12.2]
-	  seats            01 N (0, -5.5) faces +Z · 02 E (7, 0) faces -X
-	                   03 S (0, 5.5) faces -Z · 04 W (-7, 0) faces +X
+	  table            12 × 6.6 metal table centred on the origin (top Y 3.4)
+	  seats            clockwise from above (the next number is on the sitter's
+	                   LEFT): 01..03 north side Z = -5, X = -3.8 / 0 / 3.8;
+	                   04 east end (7.9, 0); 05..07 south side Z = +5,
+	                   X = 3.8 / 0 / -3.8; 08 west end (-7.9, 0). Every chair is
+	                   turned toward the table (side chairs angle in slightly).
 	  bulb             BulbPivot (0, 13.6, 0); bulb 5.05 studs below it
 
 	Room and lounge are sealed boxes; the only thing between them is the
 	mirror glass, so nobody can walk from one to the other.
-	Dynamic lights: BulbLight, TVGlow, Fill, AlarmLight (disabled), Lounge = 5.
+	Dynamic lights: BulbLight, TVGlow, Fill, FillEast, AlarmLight (disabled),
+	Lounge = 6.
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -54,6 +61,7 @@ local MIRROR_BOTTOM, MIRROR_TOP = 3, 11
 local LOUNGE_MIN_X, LOUNGE_MAX_X = 15, 29
 local LOUNGE_TOP = FLOOR + 12 -- 12.2
 local TABLE_TOP = FLOOR + 3.2 -- 3.4
+local TABLE_LENGTH, TABLE_DEPTH = 12, 6.6 -- along X, along Z
 local BULB_PIVOT_Y = 13.6
 local BULB_DROP = 5.05
 local TV_WALL_X = -ROOM_HALF_X -- -14
@@ -62,13 +70,23 @@ local DOOR_X = 6
 
 local InterrogationModule = {}
 
--- Seat layout: clockwise from above starting north.
+-- Seat layout: CLOCKWISE FROM ABOVE, so whoever sits at seat N (facing the
+-- table) has seat N + 1 on their LEFT. Must hold Config.Queue.Capacity seats.
+local SIDE_Z = 5 -- long sides
+local END_X = 7.9 -- short ends
 local SEATS = {
-	V(0, 0, -5.5), -- 01 north
-	V(7, 0, 0), -- 02 east
-	V(0, 0, 5.5), -- 03 south
-	V(-7, 0, 0), -- 04 west
+	V(-3.8, 0, -SIDE_Z), -- 01 north, west
+	V(0, 0, -SIDE_Z), -- 02 north, middle
+	V(3.8, 0, -SIDE_Z), -- 03 north, east
+	V(END_X, 0, 0), -- 04 east end (mirror side)
+	V(3.8, 0, SIDE_Z), -- 05 south, east
+	V(0, 0, SIDE_Z), -- 06 south, middle
+	V(-3.8, 0, SIDE_Z), -- 07 south, west
+	V(-END_X, 0, 0), -- 08 west end (TV side)
 }
+assert(#SEATS >= Config.Queue.Capacity, "InterrogationModule: fewer seats than Config.Queue.Capacity")
+-- Side chairs turn in toward this fraction of their X (ends face straight in).
+local SEAT_AIM_X = 0.4
 
 local function faceFrame(point: Vector3, toward: Vector3): CFrame
 	return CFrame.lookAt(point, V(toward.X, point.Y, toward.Z))
@@ -290,17 +308,36 @@ local function buildFurniture(module: Model)
 	local d = Builder.getFolder(module, "RoomDecor")
 	local seats = Builder.getFolder(module, Names.Seats)
 
-	Props.CreateTable(C(0, FLOOR, 0), d, { width = 10, depth = 7, height = TABLE_TOP - FLOOR, style = "Metal", name = "InterrogationTable" })
-	-- Table clutter, kept away from the centre so the bulb pool stays clean.
-	Props.CreateMicrophone(CFrame.lookAt(V(-3.2, TABLE_TOP, 1.6), V(0, TABLE_TOP, 4)), d)
-	Props.CreatePaperStack(C(2.6, TABLE_TOP, 1.4) * CFrame.Angles(0, math.rad(-12), 0), d, { seed = 64, sheets = 2, folder = true })
-	Builder.CreatePost(d, "Ashtray", V(3.4, TABLE_TOP, -2.2), 0.12, 0.6, P.MetalDark, DECOR)
-	Builder.CreatePost(d, "Cup", V(-3.6, TABLE_TOP, -2.0), 0.45, 0.36, P.Ceramic, DECOR)
+	local tableHeight = TABLE_TOP - FLOOR
+	local tableModel = Props.CreateTable(C(0, FLOOR, 0), d, {
+		width = TABLE_LENGTH,
+		depth = TABLE_DEPTH,
+		height = tableHeight,
+		style = "Metal",
+		name = "InterrogationTable",
+	})
+	-- A long top needs a middle pair of legs (same section as the corner legs).
+	local legHeight = tableHeight - 0.65
+	for _, z in { -1, 1 } do
+		local legZ = z * (TABLE_DEPTH / 2 - 0.6)
+		decor(tableModel, "Leg", V(0.7, legHeight, 0.7), C(0, FLOOR + legHeight / 2, legZ), P.MetalDark, { shadow = true })
+		decor(tableModel, "Foot", V(1.0, 0.1, 1.0), C(0, FLOOR + 0.05, legZ), P.MetalDark)
+	end
+
+	-- Table clutter, kept away from the centre so the bulb pool stays clean
+	-- and out of the reach of the seat directly in front of it.
+	Props.CreateMicrophone(CFrame.lookAt(V(-3.4, TABLE_TOP, 1.5), V(-1.6, TABLE_TOP, 4)), d)
+	Props.CreateMicrophone(CFrame.lookAt(V(3.4, TABLE_TOP, -1.5), V(1.6, TABLE_TOP, -4)), d)
+	Props.CreatePaperStack(C(2.3, TABLE_TOP, 1.5) * CFrame.Angles(0, math.rad(-12), 0), d, { seed = 64, sheets = 2, folder = true })
+	Props.CreatePaperStack(C(-4.9, TABLE_TOP, -1.3) * CFrame.Angles(0, math.rad(9), 0), d, { seed = 65, sheets = 3, folder = true })
+	Builder.CreatePost(d, "Ashtray", V(5.0, TABLE_TOP, 1.2), 0.12, 0.6, P.MetalDark, DECOR)
+	Builder.CreatePost(d, "Cup", V(-1.9, TABLE_TOP, -2.0), 0.45, 0.36, P.Ceramic, DECOR)
+	Builder.CreatePost(d, "Cup", V(-5.2, TABLE_TOP, 1.6), 0.45, 0.36, P.Ceramic, DECOR)
 	decor(d, "CuffBolt", V(0.5, 0.06, 0.5), C(0, TABLE_TOP + 0.03, 0), P.MetalDark)
 	decor(d, "CuffLoop", V(0.08, 0.35, 0.45), C(0, TABLE_TOP + 0.2, 0), P.Chrome)
 
 	for index, position in SEATS do
-		local chairCF = CFrame.lookAt(V(position.X, FLOOR, position.Z), V(0, FLOOR, 0))
+		local chairCF = CFrame.lookAt(V(position.X, FLOOR, position.Z), V(position.X * SEAT_AIM_X, FLOOR, 0))
 		local chair = Props.CreateChair(chairCF, d, { style = "Metal", seatName = Names.SeatAnchor(index) })
 		chair.Name = `Chair{index}`
 		local seat = chair:FindFirstChild(Names.SeatAnchor(index))
@@ -345,6 +382,18 @@ local function buildRoomLights(module: Model)
 		color = P.Light.Cool,
 		brightness = 0.4,
 		range = 20,
+		angle = 120,
+		face = Enum.NormalId.Bottom,
+	})
+	-- A dimmer twin over the mirror end so the long table's east seats are
+	-- never lost in the dark when the bulb swings away.
+	decor(d, "FillHousing", V(4.4, 0.12, 1.6), C(10.5, ROOM_TOP - 0.08, 0), P.MetalDark)
+	local fillEast = Builder.CreateNeon(lights, "FillLight", V(4, 0.25, 1.2), C(10.5, ROOM_TOP - 0.145, 0), P.Neon.RoomFill)
+	Builder.AddSurfaceLight(fillEast, {
+		name = "FillEast",
+		color = P.Light.Cool,
+		brightness = 0.25,
+		range = 18,
 		angle = 120,
 		face = Enum.NormalId.Bottom,
 	})
@@ -421,12 +470,14 @@ end
 local function buildRoomCameras(module: Model)
 	local cams = Builder.getFolder(module, Names.CameraAnchors)
 	-- CFrame IS the camera (LookVector = view direction). Framing was checked
-	-- for a 60° vertical FOV at 16:9: the whole table, all four seats and the
-	-- TV fit inside the InterrogationCamera frame with margin.
-	cameraAnchor(cams, Names.IntroCamera, V(7, 6.8, 10.6), V(-3.5, 4.4, -1.2))
-	cameraAnchor(cams, Names.InterrogationCamera, V(12.6, 11.4, 9.6), V(-3.6, 3.6, -0.8))
-	cameraAnchor(cams, Names.CallerCamera, V(10, 10.6, 8), V(-5.5, 4.2, -0.8))
-	cameraAnchor(cams, Names.VictoryCamera, V(7.5, 2.4, 9.5), V(-1.5, 6.4, -1.5))
+	-- for a 60° vertical FOV at 16:9: the whole table, all eight seats (pans
+	-- and seated heads) and the TV fit inside the InterrogationCamera frame
+	-- with margin; CallerCamera keeps the TV, the table and every head.
+	cameraAnchor(cams, Names.IntroCamera, V(6.4, 7.6, 11), V(-3.5, 5, -1.5))
+	cameraAnchor(cams, Names.InterrogationCamera, V(12.8, 12.2, 10.6), V(-3.2, 4, -1))
+	cameraAnchor(cams, Names.CallerCamera, V(11.4, 11.4, 9.4), V(-5, 4.4, -1))
+	-- Low hero angle up past the bulb, threaded between seats 04 and 05.
+	cameraAnchor(cams, Names.VictoryCamera, V(11, 2.6, 7.8), V(-2, 6.6, -1))
 end
 
 ----------------------------------------------------------------------------
@@ -501,6 +552,8 @@ local function buildLoungeFurniture(module: Model)
 	Props.CreateRailing(C(LOUNGE_MIN_X + 2, FLOOR, 0) * CFrame.Angles(0, math.rad(90), 0), d, { length = 21, height = 3.6, spacing = 5.25 })
 
 	Props.CreateBench(CFrame.lookAt(V(DESK_X, FLOOR, ROOM_HALF_Z - 1.1), V(DESK_X, FLOOR, 0)), d, { width = 7 })
+	-- Second bench against the east wall (north of the door), facing the glass.
+	Props.CreateBench(CFrame.lookAt(V(LOUNGE_MAX_X - 1.1, FLOOR, -4), V(0, FLOOR, -4)), d, { width = 6 })
 	Props.CreateDoor(CFrame.lookAt(V(LOUNGE_MAX_X, FLOOR, 7), V(0, FLOOR, 7)), d, { kind = "Metal", width = 3.6, height = 8, window = true })
 	Props.CreateTrashBin(C(LOUNGE_MAX_X - 1.2, FLOOR, 2.2), d)
 
@@ -511,10 +564,16 @@ end
 
 local function buildLoungeMarkers(module: Model)
 	local spawns = Builder.getFolder(module, Names.SpectatorSpawns)
-	for index, z in { -4.5, -1.5, 1.5, 4.5 } do
-		-- On the lounge floor, facing -X toward the mirror.
-		local at = V(23, FLOOR + 0.12, z)
-		Builder.CreateMarker(spawns, Names.SpectatorSpawn(index), CFrame.lookAt(at, at - Vector3.xAxis), V(2, 0.2, 2))
+	-- Two rows of four on the lounge floor, facing -X toward the mirror: the
+	-- front row (01..04) fills first, then the back row (05..08).
+	local rows = { 20.5, 24.5 }
+	local columns = { -4.5, -1.5, 1.5, 4.5 }
+	for row, x in rows do
+		for column, z in columns do
+			local at = V(x, FLOOR + 0.12, z)
+			local index = (row - 1) * #columns + column
+			Builder.CreateMarker(spawns, Names.SpectatorSpawn(index), CFrame.lookAt(at, at - Vector3.xAxis), V(2, 0.2, 2))
+		end
 	end
 
 	local cams = Builder.getFolder(module, Names.CameraAnchors)

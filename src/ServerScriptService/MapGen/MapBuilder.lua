@@ -42,7 +42,7 @@ local LOCKED_ATTRIBUTE = "Locked"
 local MapBuilder = {}
 
 -- Bump whenever the generator output changes so baked maps are replaced.
-MapBuilder.Version = 1
+MapBuilder.Version = 2
 
 local PARTS_PER_YIELD = 300
 

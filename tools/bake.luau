@@ -81,6 +81,9 @@ local function lookAt(pos, target, up)
 end
 local FixedCFrame = setmetatable({ lookAt = lookAt }, { __index = CFrame })
 
+-- Keyed by full name: Lune returns a fresh userdata for every access to the
+-- same Instance, so an Instance-keyed cache would never hit (each require
+-- would build a separate copy of the module).
 local cache = {}
 local env
 local function makeEnv(module)
@@ -96,15 +99,16 @@ local function makeEnv(module)
 	return t
 end
 local function req(module)
-	if cache[module] ~= nil then
-		return cache[module]
+	local key = module:GetFullName()
+	if cache[key] ~= nil then
+		return cache[key]
 	end
 	local fn = luau.load(module.Source, {
 		debugName = module:GetFullName(),
 		environment = makeEnv(module),
 	})
 	local result = fn()
-	cache[module] = result
+	cache[key] = result
 	return result
 end
 env = {

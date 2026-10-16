@@ -11,34 +11,44 @@
 	  staying only needs the box grown by ExitMarginStuds (hysteresis), so
 	  standing on the edge never flickers. Touched is not used.
 
+	PARTY SETUP (Remotes.QueueAction)
+	  The HOST is the earliest member still inside (members[1]); when they
+	  leave the next one takes over. Only the host may send
+	    ("SetParty", humans, bots)  integers, humans 1..Capacity, bots
+	                                0..Capacity-humans; when humans + bots <
+	                                MinParticipants the bots are raised to fit
+	    ("StartNow")                leave with whoever is inside (>= 1 human);
+	                                bots are topped up to MinParticipants
+	  and never while the queue is Departing (GameManager rate-limits).
+	  When the queue empties the party resets to DefaultHumans/DefaultBots.
+
 	MEMBERSHIP
 	  player -> queue map: a player is in at most one queue. Players in a
-	  match, dead, or without a root part are never added. At most Capacity
-	  members; players standing inside a full queue wait (FIFO by the time
-	  they stepped in) until a slot frees. Disconnects remove instantly.
+	  match, dead, or without a root part are never added. A chamber holds at
+	  most `wantedHumans` members; extra players standing inside wait (FIFO
+	  by the time they stepped in) and are not added. Lowering wantedHumans
+	  drops the newest members back to waiting. Disconnects remove instantly.
 
 	STATES (Remotes.QueueState)
-	  Open ──count ≥ required──► Starting (full: StartCountdownSeconds,
-	        partial: PartialStartDelaySeconds, collapsing to the short
-	        countdown as soon as the queue fills)
-	  Starting ──count < required──► Open
+	  Open ──humans ≥ wantedHumans, or StartNow──► Starting (StartCountdownSeconds)
+	  Starting ──humans < wantedHumans (no StartNow) or empty──► Open
 	  Starting ──startsAt reached──► Departing (room slot reserved) | WaitingForRoom
-	  WaitingForRoom ──slot frees──► Departing   (──count < required──► Open)
+	  WaitingForRoom ──slot frees──► Departing   (──start no longer possible──► Open)
 	  Departing: doors shut (DoorsOpen=false, DoorBlocker collides), wait
 	        DepartSeconds, then COMMIT atomically: re-validate every member,
-	        drop invalid ones, start the match if still ≥ required, else
+	        drop invalid ones, start MatchService:startMatch(humans, bots) if
+	        humans + bots ≥ MinParticipants (StartNow tops the bots up), else
 	        back to Open; doors reopen.
 
 	OUTPUT
-	  QueueNN attributes (Count, State, DoorsOpen), the "n/4" display, the
-	  status lights, Remotes.QueueStatus (to everyone, only when something
-	  changed) and Remotes.QueueMembership (to a player whose membership
-	  changed).
+	  QueueNN attributes (Count, State, DoorsOpen), the "2/3 +2 AI" display,
+	  the status lights, Remotes.QueueStatus (to everyone, only when something
+	  changed; capacity = wantedHumans + bots) and Remotes.QueueMembership
+	  (to a player whose membership changed).
 ]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local Shared = ReplicatedStorage.Shared
@@ -65,10 +75,15 @@ type Queue = {
 	lightGreen: BasePart?,
 	blocker: BasePart?,
 
-	members: { Player }, -- FIFO (entry order) = seat order of the match
+	members: { Player }, -- FIFO (entry order); members[1] is the host
 	state: QueueState,
 	startsAt: number?,
 	reservedSlot: number?,
+
+	-- Party setup (host's choice)
+	wantedHumans: number,
+	bots: number,
+	startNow: boolean, -- "START NOW" pressed: leave with whoever is inside
 
 	-- Last values written to the world / sent to clients (change detection
 	-- without per-scan allocations).
@@ -76,15 +91,19 @@ type Queue = {
 	shownState: QueueState?,
 	shownSeconds: number?,
 	shownFull: boolean?,
+	shownWanted: number?,
+	shownBots: number?,
 	sentCount: number?,
 	sentState: QueueState?,
 	sentStartsAt: number?,
+	sentHost: number?,
+	sentWanted: number?,
+	sentBots: number?,
 }
 
 type QueueServiceData = {
 	matchService: MatchService.MatchService,
 	queues: { Queue }, -- ordered by index
-	required: number,
 	playerQueue: { [Player]: Queue },
 	waitingQueue: { [Player]: Queue }, -- standing inside a queue they are not (yet) a member of
 	waitingSince: { [Player]: number },
@@ -107,15 +126,43 @@ local function log(message: string)
 	end
 end
 
--- Players needed before a queue may start: the Studio minimum while testing,
--- clamped to [3, Capacity] (3 = 1 Caller + 2 answerers is the smallest game).
-local function requiredPlayers(): number
-	local capacity = Config.Queue.Capacity
-	local wanted = if RunService:IsStudio()
-		then Config.Queue.StudioMinPlayersToStart
-		else Config.Queue.MinPlayersToStart
-	return math.clamp(wanted, math.min(3, capacity), capacity)
+----------------------------------------------------------------------------
+-- Party rules
+----------------------------------------------------------------------------
+
+-- Smallest playable match (bots count), never more than a chamber holds.
+local function minimumParticipants(): number
+	return math.min(Config.Queue.MinParticipants, Config.Queue.Capacity)
 end
+
+-- Makes a (humans, bots) choice legal: humans 1..Capacity, bots
+-- 0..Capacity-humans, raised so humans + bots >= MinParticipants. With bots
+-- disabled the humans are raised instead.
+local function normalizeParty(humans: number, bots: number): (number, number)
+	local capacity = Config.Queue.Capacity
+	local minimum = minimumParticipants()
+	local wanted = math.clamp(humans, 1, capacity)
+	if not Config.Bots.Enabled then
+		return math.max(wanted, minimum), 0
+	end
+	local chosen = math.clamp(bots, 0, capacity - wanted)
+	if wanted + chosen < minimum then
+		chosen = minimum - wanted
+	end
+	return wanted, chosen
+end
+
+-- Integer in [low, high]; rejects NaN, infinities, fractions and non-numbers.
+local function asCount(value: unknown, low: number, high: number): number?
+	if type(value) == "number" and value == value and value % 1 == 0 and value >= low and value <= high then
+		return value
+	end
+	return nil
+end
+
+----------------------------------------------------------------------------
+-- World lookups
+----------------------------------------------------------------------------
 
 local function findPart(container: Instance, name: string): BasePart?
 	local found = container:FindFirstChild(name, true)
@@ -172,6 +219,7 @@ local function buildQueue(queuesFolder: Instance, index: number): Queue?
 	if model:GetAttribute(Names.AttrQueueIndex) == nil then
 		model:SetAttribute(Names.AttrQueueIndex, index)
 	end
+	local wanted, bots = normalizeParty(Config.Queue.DefaultHumans, Config.Queue.DefaultBots)
 	return {
 		index = index,
 		model = model,
@@ -185,13 +233,21 @@ local function buildQueue(queuesFolder: Instance, index: number): Queue?
 		state = "Open",
 		startsAt = nil,
 		reservedSlot = nil,
+		wantedHumans = wanted,
+		bots = bots,
+		startNow = false,
 		shownCount = nil,
 		shownState = nil,
 		shownSeconds = nil,
 		shownFull = nil,
+		shownWanted = nil,
+		shownBots = nil,
 		sentCount = nil,
 		sentState = nil,
 		sentStartsAt = nil,
+		sentHost = nil,
+		sentWanted = nil,
+		sentBots = nil,
 	}
 end
 
@@ -204,7 +260,6 @@ function QueueService.new(map: Instance, matchService: MatchService.MatchService
 	local self: QueueServiceData = {
 		matchService = matchService,
 		queues = {},
-		required = requiredPlayers(),
 		playerQueue = {},
 		waitingQueue = {},
 		waitingSince = waitingSince,
@@ -238,7 +293,7 @@ function QueueService.new(map: Instance, matchService: MatchService.MatchService
 		end
 	end
 	service.statuses = service:buildStatuses()
-	log(`{#service.queues} queues, {service.required} players required to start`)
+	log(`{#service.queues} queues, up to {Config.Queue.Capacity} participants each`)
 	return service
 end
 
@@ -280,6 +335,10 @@ function QueueService.queueIndexOf(self: QueueService, player: Player): number?
 	return if queue then queue.index else nil
 end
 
+function QueueService.hostOf(_self: QueueService, queue: Queue): Player?
+	return queue.members[1]
+end
+
 -- Connected, alive, with a root part, and not already in a match.
 function QueueService.isEligible(self: QueueService, player: Player): boolean
 	return player.Parent == Players and CharacterUtil.isAlive(player) and not self.matchService:isInMatch(player)
@@ -309,9 +368,38 @@ function QueueService.queueAt(self: QueueService, player: Player): Queue?
 	return nil
 end
 
+-- Bots that would ride along if `humans` humans left right now.
+function QueueService.launchBots(_self: QueueService, queue: Queue, humans: number): number
+	if not Config.Bots.Enabled then
+		return 0
+	end
+	local bots = queue.bots
+	if queue.startNow then
+		bots = math.max(bots, minimumParticipants() - humans)
+	end
+	return math.clamp(bots, 0, math.max(Config.Queue.Capacity - humans, 0))
+end
+
+-- Can the queue start with the members it has now?
+function QueueService.canStart(self: QueueService, queue: Queue): boolean
+	local humans = #queue.members
+	if humans == 0 then
+		return false
+	end
+	if not queue.startNow and humans < queue.wantedHumans then
+		return false
+	end
+	return humans + self:launchBots(queue, humans) >= minimumParticipants()
+end
+
 ----------------------------------------------------------------------------
 -- Membership
 ----------------------------------------------------------------------------
+
+function QueueService.resetParty(_self: QueueService, queue: Queue)
+	queue.wantedHumans, queue.bots = normalizeParty(Config.Queue.DefaultHumans, Config.Queue.DefaultBots)
+	queue.startNow = false
+end
 
 function QueueService.addMember(self: QueueService, queue: Queue, player: Player)
 	table.insert(queue.members, player)
@@ -319,11 +407,11 @@ function QueueService.addMember(self: QueueService, queue: Queue, player: Player
 	self.waitingQueue[player] = nil
 	self.waitingSince[player] = nil
 	Remotes.QueueMembership:FireClient(player, queue.index)
-	log(`{player.Name} joined {Names.Queue(queue.index)} ({#queue.members})`)
+	log(`{player.Name} joined {Names.Queue(queue.index)} ({#queue.members}/{queue.wantedHumans})`)
 end
 
 -- Removes `player` from `queue`. `notify` sends QueueMembership(nil) when the
--- player is still connected.
+-- player is still connected. An emptied queue gets the default party back.
 function QueueService.removeMember(self: QueueService, queue: Queue, player: Player, notify: boolean)
 	local position = table.find(queue.members, player)
 	if position then
@@ -334,6 +422,9 @@ function QueueService.removeMember(self: QueueService, queue: Queue, player: Pla
 	end
 	if notify and player.Parent == Players then
 		Remotes.QueueMembership:FireClient(player, nil)
+	end
+	if #queue.members == 0 then
+		self:resetParty(queue)
 	end
 	log(`{player.Name} left {Names.Queue(queue.index)} ({#queue.members})`)
 end
@@ -351,7 +442,7 @@ function QueueService.pruneMembers(self: QueueService, queue: Queue)
 end
 
 -- Adds players standing inside a queue's entry box, oldest arrival first,
--- while the queue has room and is not departing.
+-- while the queue wants more humans and is not departing.
 function QueueService.admitPlayers(self: QueueService, now: number)
 	local candidates = self.candidates
 	table.clear(candidates)
@@ -383,7 +474,7 @@ function QueueService.admitPlayers(self: QueueService, now: number)
 	end
 	for _, player in candidates do
 		local queue = self.waitingQueue[player]
-		if queue and queue.state ~= "Departing" and #queue.members < Config.Queue.Capacity then
+		if queue and queue.state ~= "Departing" and #queue.members < queue.wantedHumans then
 			self:addMember(queue, player)
 		end
 	end
@@ -410,23 +501,20 @@ end
 
 function QueueService.updateQueue(self: QueueService, queue: Queue, now: number)
 	if queue.state ~= "Departing" then
-		local count = #queue.members
-		local capacity = Config.Queue.Capacity
-		if count < self.required then
+		if not self:canStart(queue) then
 			queue.state = "Open"
 			queue.startsAt = nil
+			if #queue.members == 0 then
+				queue.startNow = false
+			end
 		elseif queue.state == "Open" then
 			queue.state = "Starting"
-			queue.startsAt = now
-				+ (if count >= capacity then Config.Queue.StartCountdownSeconds else Config.Queue.PartialStartDelaySeconds)
+			queue.startsAt = now + Config.Queue.StartCountdownSeconds
 		elseif queue.state == "Starting" then
-			local startsAt = queue.startsAt or now
-			if count >= capacity then
-				-- A full queue never waits longer than the short countdown.
-				startsAt = math.min(startsAt, now + Config.Queue.StartCountdownSeconds)
-			end
-			queue.startsAt = startsAt
-			if now >= startsAt then
+			local startsAt = queue.startsAt
+			if startsAt == nil then
+				queue.startsAt = now + Config.Queue.StartCountdownSeconds
+			elseif now >= startsAt then
 				self:beginDeparture(queue)
 			end
 		elseif queue.state == "WaitingForRoom" then
@@ -457,7 +545,7 @@ function QueueService.beginDeparture(self: QueueService, queue: Queue)
 end
 
 -- Runs after DepartSeconds. Whatever happens, the queue ends up Open with its
--- doors open and the slot reservation consumed or released.
+-- doors open, StartNow cleared and the slot reservation consumed or released.
 function QueueService.commitDeparture(self: QueueService, queue: Queue)
 	local slot = queue.reservedSlot
 	queue.reservedSlot = nil
@@ -470,6 +558,7 @@ function QueueService.commitDeparture(self: QueueService, queue: Queue)
 	end
 	queue.state = "Open"
 	queue.startsAt = nil
+	queue.startNow = false
 	self:setDoors(queue, true)
 	self:updateQueue(queue, Workspace:GetServerTimeNow())
 	self:broadcastIfChanged()
@@ -486,8 +575,10 @@ function QueueService.launch(self: QueueService, queue: Queue, slot: number?)
 		end
 	end
 
-	if #members < self.required then
-		log(`{Names.Queue(queue.index)} departure cancelled ({#members} valid riders)`)
+	local humans = #members
+	local bots = self:launchBots(queue, humans)
+	if humans == 0 or humans + bots < minimumParticipants() then
+		log(`{Names.Queue(queue.index)} departure cancelled ({humans} valid riders + {bots} bots)`)
 		if slot ~= nil then
 			self.matchService:releaseReservation(slot)
 		end
@@ -495,7 +586,7 @@ function QueueService.launch(self: QueueService, queue: Queue, slot: number?)
 	end
 
 	local riders = table.clone(members)
-	local match = self.matchService:startMatch(riders, queue.index, slot)
+	local match = self.matchService:startMatch(riders, bots, queue.index, slot)
 	if not match then
 		warn(`[QueueService] {Names.Queue(queue.index)}: the match could not start; riders stay queued`)
 		return
@@ -509,6 +600,7 @@ function QueueService.launch(self: QueueService, queue: Queue, slot: number?)
 		end
 	end
 	table.clear(members)
+	self:resetParty(queue)
 end
 
 ----------------------------------------------------------------------------
@@ -522,10 +614,11 @@ function QueueService.setDoors(_self: QueueService, queue: Queue, open: boolean)
 	end
 end
 
--- Attributes, "n/4" label and lights. Writes only what changed.
+-- Attributes, "2/3 +2 AI" label and lights. Writes only what changed.
 function QueueService.refreshVisuals(_self: QueueService, queue: Queue, now: number)
 	local count = #queue.members
-	local capacity = Config.Queue.Capacity
+	local wanted = queue.wantedHumans
+	local bots = queue.bots
 	local state: QueueState = queue.state
 	local startsAt = queue.startsAt
 	local seconds = if state == "Starting" and startsAt then math.max(0, math.ceil(startsAt - now)) else -1
@@ -537,8 +630,20 @@ function QueueService.refreshVisuals(_self: QueueService, queue: Queue, now: num
 		queue.model:SetAttribute(Names.AttrQueueState, state)
 	end
 	local label = queue.label
-	if label and (queue.shownCount ~= count or queue.shownState ~= state or queue.shownSeconds ~= seconds) then
-		local text = `{count}/{capacity}`
+	if
+		label
+		and (
+			queue.shownCount ~= count
+			or queue.shownState ~= state
+			or queue.shownSeconds ~= seconds
+			or queue.shownWanted ~= wanted
+			or queue.shownBots ~= bots
+		)
+	then
+		local text = `{count}/{wanted}`
+		if bots > 0 then
+			text ..= ` +{bots} AI`
+		end
 		if seconds >= 0 then
 			text ..= string.format("  %d:%02d", seconds // 60, seconds % 60)
 		elseif state == "WaitingForRoom" then
@@ -549,9 +654,11 @@ function QueueService.refreshVisuals(_self: QueueService, queue: Queue, now: num
 	queue.shownCount = count
 	queue.shownState = state
 	queue.shownSeconds = seconds
+	queue.shownWanted = wanted
+	queue.shownBots = bots
 
 	-- Green = come in; red = full or leaving.
-	local full = state == "Departing" or state == "WaitingForRoom" or count >= capacity
+	local full = state == "Departing" or state == "WaitingForRoom" or count >= wanted
 	if queue.shownFull ~= full then
 		queue.shownFull = full
 		setLight(queue.lightGreen, not full)
@@ -562,26 +669,42 @@ end
 function QueueService.buildStatuses(self: QueueService): { Remotes.QueueStatus }
 	local statuses: { Remotes.QueueStatus } = table.create(#self.queues)
 	for _, queue in self.queues do
+		local host = self:hostOf(queue)
 		table.insert(statuses, {
 			index = queue.index,
 			count = #queue.members,
-			capacity = Config.Queue.Capacity,
+			capacity = queue.wantedHumans + queue.bots,
 			state = queue.state,
 			startsAt = if queue.state == "Starting" then queue.startsAt else nil,
+			hostUserId = if host then host.UserId else nil,
+			wantedHumans = queue.wantedHumans,
+			bots = queue.bots,
 		})
 	end
 	return statuses
 end
 
--- FireAllClients(QueueStatus) only when a count, state or start time changed.
+-- FireAllClients(QueueStatus) only when something a client shows changed.
 function QueueService.broadcastIfChanged(self: QueueService)
 	local changed = false
 	for _, queue in self.queues do
 		local count = #queue.members
-		if queue.sentCount ~= count or queue.sentState ~= queue.state or queue.sentStartsAt ~= queue.startsAt then
+		local host = self:hostOf(queue)
+		local hostId = if host then host.UserId else nil
+		if
+			queue.sentCount ~= count
+			or queue.sentState ~= queue.state
+			or queue.sentStartsAt ~= queue.startsAt
+			or queue.sentHost ~= hostId
+			or queue.sentWanted ~= queue.wantedHumans
+			or queue.sentBots ~= queue.bots
+		then
 			queue.sentCount = count
 			queue.sentState = queue.state
 			queue.sentStartsAt = queue.startsAt
+			queue.sentHost = hostId
+			queue.sentWanted = queue.wantedHumans
+			queue.sentBots = queue.bots
 			changed = true
 		end
 	end
@@ -594,6 +717,67 @@ end
 ----------------------------------------------------------------------------
 -- Player input / lifecycle
 ----------------------------------------------------------------------------
+
+-- The host changes the party. Members beyond the new wantedHumans (newest
+-- first) go back to waiting; a pending StartNow is cleared.
+function QueueService.setParty(self: QueueService, queue: Queue, humans: number, bots: number)
+	local wanted, chosen = normalizeParty(humans, bots)
+	queue.wantedHumans = wanted
+	queue.bots = chosen
+	queue.startNow = false
+	local members = queue.members
+	for position = #members, wanted + 1, -1 do
+		self:removeMember(queue, members[position], true)
+	end
+	log(`{Names.Queue(queue.index)} party: {wanted} humans + {chosen} bots`)
+end
+
+-- The host leaves now with whoever is inside (bots topped up). Ignored when
+-- even that would be too few (bots disabled).
+function QueueService.pressStartNow(self: QueueService, queue: Queue, now: number)
+	local humans = #queue.members
+	if humans == 0 or queue.startNow then
+		return
+	end
+	queue.startNow = true
+	if not self:canStart(queue) then
+		queue.startNow = false
+		return
+	end
+	if queue.state == "Open" then
+		queue.state = "Starting"
+		queue.startsAt = now + Config.Queue.StartCountdownSeconds
+	end
+	log(`{Names.Queue(queue.index)} START NOW with {humans} humans + {self:launchBots(queue, humans)} bots`)
+end
+
+-- QueueAction remote (rate-limited by GameManager). Only the host of a queue
+-- that is not departing; anything malformed is dropped silently.
+function QueueService.onQueueAction(self: QueueService, player: Player, action: unknown, first: unknown, second: unknown)
+	local queue = self.playerQueue[player]
+	if not queue or queue.state == "Departing" or self:hostOf(queue) ~= player then
+		return
+	end
+	local now = Workspace:GetServerTimeNow()
+	if action == "SetParty" then
+		local capacity = Config.Queue.Capacity
+		local humans = asCount(first, 1, capacity)
+		if humans == nil then
+			return
+		end
+		local bots = asCount(second, 0, capacity - humans)
+		if bots == nil then
+			return
+		end
+		self:setParty(queue, humans, bots)
+	elseif action == "StartNow" then
+		self:pressStartNow(queue, now)
+	else
+		return
+	end
+	self:updateQueue(queue, now)
+	self:broadcastIfChanged()
+end
 
 -- LeaveQueue remote: allowed unless the doors are already closing.
 function QueueService.leaveQueue(self: QueueService, player: Player)

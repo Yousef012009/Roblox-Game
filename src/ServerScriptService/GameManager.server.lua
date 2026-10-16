@@ -116,6 +116,12 @@ Remotes.LeaveQueue.OnServerEvent:Connect(function(player: Player)
 	end
 end)
 
+Remotes.QueueAction.OnServerEvent:Connect(function(player: Player, action: unknown, humans: unknown, bots: unknown)
+	if limiter:allow(player, "QueueAction") then
+		queueService:onQueueAction(player, action, humans, bots)
+	end
+end)
+
 Remotes.GetState.OnServerInvoke = function(player: Player): Remotes.ClientState
 	if not limiter:allow(player, "GetState") then
 		local cached = lastClientState[player]

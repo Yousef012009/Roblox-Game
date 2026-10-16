@@ -14,7 +14,7 @@ local UIKit = require(script.Parent.UIKit)
 
 local Metronome = {}
 
-local PULSE = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local PULSE = TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 
 local root: Frame
 local digits: { TextLabel } = {}
@@ -29,7 +29,7 @@ function Metronome.mount(parent: Instance)
 		BackgroundTransparency = 0.35,
 		BorderSizePixel = 0,
 		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 94),
+		Position = UDim2.new(0.5, 0, 0, UIKit.Layout.MetronomeTop),
 		Size = UDim2.fromOffset(176, 24),
 		Visible = false,
 		ZIndex = 5,
@@ -105,7 +105,7 @@ function Metronome.step(beat: number?)
 	for i, digit in digits do
 		if i == current then
 			digit.TextColor3 = if i == 1 then UIKit.Colors.Amber else UIKit.Colors.Phosphor
-			scales[i].Scale = 1.45
+			scales[i].Scale = if i == 1 then 1.6 else 1.45
 			UIKit.tween(scales[i], PULSE, { Scale = 1 })
 		else
 			digit.TextColor3 = UIKit.Colors.TextFaint

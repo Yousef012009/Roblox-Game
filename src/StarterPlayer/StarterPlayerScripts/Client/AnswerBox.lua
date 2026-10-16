@@ -24,7 +24,7 @@ local HEIGHT = 124
 local REST_ANCHOR = Vector2.new(0.5, 1)
 local REST_POSITION = UDim2.new(0.5, 0, 1, -10)
 local FOCUS_ANCHOR = Vector2.new(0.5, 0)
-local FOCUS_POSITION = UDim2.new(0.5, 0, 0, 122) -- under the GameHUD + metronome
+local FOCUS_POSITION = UDim2.new(0.5, 0, 0, UIKit.Layout.BelowHud) -- under the GameHUD + metronome
 
 local root: Frame
 local headerLabel: TextLabel
@@ -243,6 +243,9 @@ function AnswerBox.step()
 		lastSeconds = seconds
 		timerLabel.Text = UIKit.clock(seconds)
 		timerLabel.TextColor3 = if seconds <= 2 then UIKit.Colors.Red else UIKit.Colors.Text
+		if seconds <= 2 and seconds > 0 then
+			UIKit.pulse(timerLabel, 1.4, 0.35)
+		end
 		UIKit.setText(headerLabel, if sentTurnId == turnId then "ANSWER SENT" else "YOUR TURN")
 	end
 	local total = turn.endsAt - turn.startsAt

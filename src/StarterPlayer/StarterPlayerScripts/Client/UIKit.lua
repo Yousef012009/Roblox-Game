@@ -8,6 +8,13 @@
 
 	Every screen builds its instances ONCE through these helpers and later
 	only changes text / visibility (UIKit.setText skips identical writes).
+
+	Motion (cheap, tween-only, no per-frame work):
+	  • reveal()   panels slide in with a slight Back overshoot + scale pop
+	  • button()   squish on press, brighten on hover (wired once at build)
+	  • pulse()    a quick scale "pop" (timers, metronome, stamps)
+	One UIScale per object is shared by all of these; an object may carry a
+	"BaseScale" attribute (e.g. a viewport-fit scale) that motion returns to.
 ]]
 
 local Players = game:GetService("Players")
@@ -40,7 +47,22 @@ UIKit.Fonts = {
 UIKit.PanelTransparency = 0.18
 UIKit.TouchMin = 44 -- minimum touch target (px)
 
+-- Shared vertical layout of the match screens (px from the top safe inset).
+-- The HUD reserves two chip rows so up to 8 participants fit on a phone.
+UIKit.Layout = {
+	HudTop = 4,
+	HudHeight = 100,
+	MetronomeTop = 108, -- under the HUD
+	BelowHud = 136, -- under the HUD + metronome: toasts, cards, focused inputs
+}
+
 local QUICK = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local OVERSHOOT = TweenInfo.new(0.32, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local PRESS = TweenInfo.new(0.07, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local RELEASE = TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local HOVER = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local PRESS_SCALE = 0.92
+local HOVER_LIFT = 0.16 -- background lerp toward the accent while hovered
 
 export type Props = { [string]: any }
 
@@ -132,7 +154,7 @@ function UIKit.button(props: Props, accent: Color3?, maxTextSize: number?): Text
 		BackgroundColor3 = UIKit.Colors.PanelLight,
 		BackgroundTransparency = 0.1,
 		BorderSizePixel = 0,
-		AutoButtonColor = true,
+		AutoButtonColor = false, -- bindButtonMotion does hover / press feedback
 		Font = UIKit.Fonts.Body,
 		TextColor3 = color,
 		TextScaled = true,
@@ -147,7 +169,79 @@ function UIKit.button(props: Props, accent: Color3?, maxTextSize: number?): Text
 		UIKit.padding(4),
 		UIKit.new("UITextSizeConstraint", { MaxTextSize = maxTextSize or 20, MinTextSize = 10 }),
 	})
+	UIKit.bindButtonMotion(button, color)
 	return button
+end
+
+-- The UIScale every motion helper shares (created on first use).
+function UIKit.scaleOf(gui: GuiObject): UIScale
+	local existing = gui:FindFirstChildOfClass("UIScale")
+	if existing then
+		return existing
+	end
+	local created: UIScale = UIKit.new("UIScale", { Name = "MotionScale", Scale = UIKit.baseScale(gui), Parent = gui })
+	return created
+end
+
+function UIKit.baseScale(gui: GuiObject): number
+	local base = gui:GetAttribute("BaseScale")
+	return if type(base) == "number" then base else 1
+end
+
+-- Squish on press, brighten on hover. Wired once per button for the life of
+-- the (never-reset) ScreenGui; disabled buttons (Active = false) stay still.
+function UIKit.bindButtonMotion(button: GuiButton, accent: Color3)
+	local hoverColor: Color3? = nil
+	local baseColor = button.BackgroundColor3
+	local function release()
+		local scale = UIKit.scaleOf(button)
+		UIKit.tween(scale, RELEASE, { Scale = UIKit.baseScale(button) })
+	end
+	local function unhover()
+		if hoverColor and button.BackgroundColor3 == hoverColor then
+			UIKit.tween(button, HOVER, { BackgroundColor3 = baseColor })
+		end
+		hoverColor = nil
+	end
+	button.MouseButton1Down:Connect(function()
+		if button.Active then
+			UIKit.tween(UIKit.scaleOf(button), PRESS, { Scale = UIKit.baseScale(button) * PRESS_SCALE })
+		end
+	end)
+	button.MouseButton1Up:Connect(release)
+	button.MouseEnter:Connect(function()
+		if not button.Active then
+			return
+		end
+		baseColor = button.BackgroundColor3
+		local lifted = baseColor:Lerp(accent, HOVER_LIFT)
+		hoverColor = lifted
+		UIKit.tween(button, HOVER, { BackgroundColor3 = lifted })
+	end)
+	button.MouseLeave:Connect(function()
+		release()
+		unhover()
+	end)
+end
+
+-- A quick scale pop (peak -> base) on any GuiObject.
+function UIKit.pulse(gui: GuiObject, peak: number?, seconds: number?)
+	local scale = UIKit.scaleOf(gui)
+	local base = UIKit.baseScale(gui)
+	scale.Scale = base * (peak or 1.25)
+	UIKit.tween(
+		scale,
+		TweenInfo.new(seconds or 0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Scale = base }
+	)
+end
+
+-- Rich-text escaping for user-provided strings.
+function UIKit.escape(text: string): string
+	local escaped = string.gsub(text, "&", "&amp;")
+	escaped = string.gsub(escaped, "<", "&lt;")
+	escaped = string.gsub(escaped, ">", "&gt;")
+	return escaped
 end
 
 -- Enables/disables a button and dims it.
@@ -156,7 +250,6 @@ function UIKit.setEnabled(button: GuiButton, enabled: boolean)
 		return
 	end
 	button.Active = enabled
-	button.AutoButtonColor = enabled
 	local textButton = button :: any
 	if button:IsA("TextButton") then
 		textButton.TextTransparency = if enabled then 0 else 0.6
@@ -188,8 +281,9 @@ function UIKit.tween(inst: Instance, info: TweenInfo?, goal: { [string]: any }):
 end
 
 -- Shows a frame with a short slide-in from `fromOffsetY` px below its resting
--- position (resting position stored as an attribute on first use).
-function UIKit.reveal(frame: GuiObject, fromOffsetY: number?)
+-- position (resting position stored as an attribute on first use), with a
+-- slight overshoot and a scale pop. `fromOffsetX` slides sideways instead.
+function UIKit.reveal(frame: GuiObject, fromOffsetY: number?, fromOffsetX: number?)
 	local rest = frame:GetAttribute("RestPosition")
 	if typeof(rest) ~= "UDim2" then
 		rest = frame.Position
@@ -199,9 +293,19 @@ function UIKit.reveal(frame: GuiObject, fromOffsetY: number?)
 	if frame.Visible then
 		return
 	end
-	frame.Position = restPos + UDim2.fromOffset(0, fromOffsetY or 8)
+	frame.Position = restPos + UDim2.fromOffset(fromOffsetX or 0, fromOffsetY or 8)
 	frame.Visible = true
-	UIKit.tween(frame, QUICK, { Position = restPos })
+	UIKit.tween(frame, OVERSHOOT, { Position = restPos })
+	local scale = UIKit.scaleOf(frame)
+	local base = UIKit.baseScale(frame)
+	scale.Scale = base * 0.94
+	UIKit.tween(scale, OVERSHOOT, { Scale = base })
+end
+
+-- Moves a revealed frame's resting position (e.g. on orientation change).
+function UIKit.setRestPosition(frame: GuiObject, position: UDim2)
+	frame:SetAttribute("RestPosition", position)
+	frame.Position = position
 end
 
 -- "m:ss" for a number of seconds (rounded up, never negative).

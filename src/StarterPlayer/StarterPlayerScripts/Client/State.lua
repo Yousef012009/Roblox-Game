@@ -71,6 +71,38 @@ function State.nameOf(userId: number?): string
 	return if live then live.DisplayName else "UNKNOWN"
 end
 
+-- AI detectives have negative userIds and no Player; trust the flag first.
+function State.isBot(userId: number?): boolean
+	if userId == nil then
+		return false
+	end
+	local player = State.playersById[userId]
+	if player then
+		return player.isBot == true
+	end
+	return userId < 0
+end
+
+-- Upper-case display name with an "(AI)" tag for bots (plain text).
+function State.tagName(userId: number?): string
+	local name = string.upper(State.nameOf(userId))
+	return if State.isBot(userId) then `{name} (AI)` else name
+end
+
+-- Number of participants still in play (status Active).
+function State.activeCount(): number
+	local snapshot = State.snapshot
+	local count = 0
+	if snapshot and type(snapshot.players) == "table" then
+		for _, player in snapshot.players do
+			if player.status == "Active" then
+				count += 1
+			end
+		end
+	end
+	return count
+end
+
 function State.isCaller(): boolean
 	local snapshot = State.snapshot
 	return snapshot ~= nil and snapshot.callerUserId == State.localUserId

@@ -274,11 +274,17 @@ local function buildGameplayParts(model: Model, index: number)
 	-- Exit marker on the lobby floor, 6 studs out, facing away from the doors.
 	Builder.CreateMarker(model, Names.QueueExit(index), facingLobby(V(0, FLOOR + 0.12, 6)), V(2, 0.2, 2))
 
-	-- Four standing marks (2 × 2), slightly above the floor, facing the doors.
-	local spots = { V(-2.4, 0, CHAMBER_Z - 2.4), V(2.4, 0, CHAMBER_Z - 2.4), V(-2.4, 0, CHAMBER_Z + 2.4), V(2.4, 0, CHAMBER_Z + 2.4) }
-	for spot, position in spots do
-		local cf = facingLobby(V(position.X, FLOOR + 0.045, position.Z))
-		Builder.CreateNeon(model, Names.QueueSpot(index, spot), V(2.5, 0.05, 2.5), cf, P.Neon.FloorMark)
+	-- Standing marks: two rows of four (back row Spot1..4 fills first, then
+	-- the front row Spot5..8), inside the trigger, facing the doors.
+	local columns = { -3.75, -1.25, 1.25, 3.75 }
+	local rows = { CHAMBER_Z - 2.3, CHAMBER_Z + 2.3 }
+	assert(#rows * #columns >= Config.Queue.Capacity, "QueueElevator: fewer standing marks than Config.Queue.Capacity")
+	for row, z in rows do
+		for column, x in columns do
+			local spot = (row - 1) * #columns + column
+			local cf = facingLobby(V(x, FLOOR + 0.045, z))
+			Builder.CreateNeon(model, Names.QueueSpot(index, spot), V(2.1, 0.05, 2.1), cf, P.Neon.FloorMark)
+		end
 	end
 
 	-- Sliding doors, built CLOSED and staggered in depth so they never

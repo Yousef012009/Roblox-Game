@@ -2,13 +2,26 @@
 --[[
 	Match  (ModuleScript)  ·  ServerScriptService/Server/Match
 
-	ONE match: its players, its cloned room and its rounds. Every piece of
-	mutable state lives on the instance (no module-level round variables),
+	ONE match: its participants, its cloned room and its rounds. Every piece
+	of mutable state lives on the instance (no module-level round variables),
 	so any number of matches run side by side. Created by MatchService.
+
+	PARTICIPANTS
+	  A record is a human (record.player) or an AI detective (record.isBot,
+	  record.player == nil, a negative userId, a name from Config.Bots.Names
+	  and a BotRig body in the room's "Bots" folder). Humans and bots are
+	  shuffled together and spread evenly over the room's seats in clockwise
+	  order (RoomController.spreadSeats: 4 of 8 seats -> 1, 3, 5, 7);
+	  records are kept in that clockwise order (record.index). Bots never
+	  leave; when no human is connected any more the match is CLEANed UP at
+	  once. MinPlayersToContinue counts bots. Bots act through the same
+	  validated input paths as humans (submitCategoryFrom / submitAnswerFrom /
+	  judgeAnswerFrom), driven by BotBrain from tracked threads that re-check
+	  the match, state and turn after every wait and are cancelled at CLEANUP.
 
 	STATE MACHINE  (Remotes.MatchState, docs/ARCHITECTURE.md §4)
 
-	  (load: stream the room, wait for characters, seat everyone, lock movement)
+	  (load: stream the room, wait for characters, build bot bodies, seat everyone, lock movement)
 	  INTRO ──IntroSeconds──► CALLER_SELECTION ──CallerRevealSeconds──► CATEGORY_SELECTION
 	  CATEGORY_SELECTION ──category set (submitted · timeout · Caller left · filter down)──► COUNTDOWN
 	  COUNTDOWN ──song reaches MusicTimeline.LoopStartBeat──► PLAYING
@@ -35,8 +48,10 @@
 	  `version`; every turn has a fresh `turnId`.
 
 	POLICIES
-	  • Caller: random in round 1, then the next connected player clockwise
-	    who has not called yet (cycles once everyone has).
+	  • Rounds: Config.Match.RoundsPerMatch, or (0) one per HUMAN (min 1).
+	  • Caller: humans who have not called yet are preferred (random in round
+	    1, then the next one clockwise); with exactly one human connected the
+	    Caller is always a bot (one that has not called yet first).
 	  • Turn order: answerers clockwise starting left of the Caller; each turn
 	    starts and ends on a beat of the song.
 	  • Blank / too long / censored input: InputRejected, the timer keeps
@@ -64,6 +79,8 @@ local Config = require(Shared.Config)
 local MusicTimeline = require(Shared.MusicTimeline)
 local Remotes = require(Shared.Remotes)
 
+local BotBrain = require(script.Parent.BotBrain)
+local BotRig = require(script.Parent.BotRig)
 local CharacterUtil = require(script.Parent.CharacterUtil)
 local RoomController = require(script.Parent.RoomController)
 local TextFilter = require(script.Parent.TextFilter)
@@ -84,6 +101,14 @@ local RESPAWN_SETTLE = 0.1 -- let the engine finish placing a fresh character be
 local RESEAT_DELAY = 0.3 -- seat watchdog: re-seat an active player this long after they stand up
 local FILTER_HOLD_MAX = 10 -- a filter call still pending this long past a deadline counts as a filter failure
 local BEAT_SAFETY = 0.05 -- never schedule a turn on a beat closer than this
+local BOT_BUILD_TIMEOUT = 8 -- engine-built bot bodies that take longer are replaced by block rigs
+local BOTS_FOLDER = "Bots" -- folder in the match room holding the bot rigs
+local STAND_RADIUS = 7 -- participants without a Seat stand on a ring this far from the room centre
+local WAVE_CHANCE = 0.5 -- a bot waves hello during INTRO
+local WAVE_DELAY = { 0.4, 2.0 }
+local POINT_CHANCE = 0.6 -- a bot Caller points at an answer it rules WRONG
+local LAUGH_CHANCE = 0.35 -- one bot chuckles when somebody else is eliminated
+local LAUGH_DELAY = { 0.3, 1.0 }
 
 if Config.Judging.TimeoutPolicy ~= "Accept" then
 	warn(`[Match] Config.Judging.TimeoutPolicy "{Config.Judging.TimeoutPolicy}" is not supported; using "Accept"`)
@@ -142,10 +167,13 @@ local REJECT_CENSORED_CATEGORY = "That category was filtered. Try another one."
 -- Types
 ----------------------------------------------------------------------------
 type PlayerRecord = {
-	player: Player,
-	userId: number,
-	name: string, -- DisplayName at match start
-	seat: number, -- == index in Match.records
+	player: Player?, -- nil for an AI detective
+	isBot: boolean,
+	rig: BotRig.BotRig?, -- bots: the body in the room (nil until built / after cleanup)
+	userId: number, -- bots: negative, unique
+	name: string, -- DisplayName at match start / bot name
+	index: number, -- position in Match.records (clockwise order)
+	seat: number, -- SeatAnchor number in the room
 	status: PlayerStatus,
 	roundWins: number,
 	acceptedCount: number,
@@ -199,7 +227,8 @@ export type MatchParams = {
 	slot: number,
 	queueIndex: number,
 	room: Model, -- already cloned, positioned and parented by MatchService
-	players: { Player }, -- seat order
+	players: { Player }, -- the humans
+	botIds: { number }, -- one negative userId per AI detective
 	releasePlayer: (player: Player) -> (), -- MatchService forgets this player's membership
 	onClosed: () -> (), -- MatchService frees the slot
 	lobbyTargets: (count: number) -> { CFrame }, -- spread-out lobby landing spots
@@ -214,8 +243,13 @@ type MatchData = {
 	params: MatchParams,
 	rng: Random,
 
-	records: { PlayerRecord }, -- sorted by seat
-	byPlayer: { [Player]: PlayerRecord },
+	records: { PlayerRecord }, -- clockwise (sorted by seat); record.index = position
+	byPlayer: { [Player]: PlayerRecord }, -- humans only
+	bySeat: { [number]: PlayerRecord },
+	hasBots: boolean,
+	botFolder: Folder?,
+	botsPending: number, -- engine bot bodies still being built
+	botThreads: { thread }, -- bot think / animation threads (cancelled at cleanup)
 
 	state: MatchState,
 	stateEndsAt: number?,
@@ -268,25 +302,83 @@ end
 -- Construction
 ----------------------------------------------------------------------------
 
+local function newRecord(userId: number, name: string, player: Player?): PlayerRecord
+	return {
+		player = player,
+		isBot = player == nil,
+		rig = nil,
+		userId = userId,
+		name = name,
+		index = 0,
+		seat = 0,
+		status = "Active",
+		roundWins = 0,
+		acceptedCount = 0,
+		wasCaller = false,
+		reseatPending = false,
+		lobbyTarget = nil,
+		characterConnection = nil,
+	}
+end
+
+local function shuffle<T>(list: { T }, rng: Random)
+	for index = #list, 2, -1 do
+		local swap = rng:NextInteger(1, index)
+		list[index], list[swap] = list[swap], list[index]
+	end
+end
+
+-- `count` distinct bot names: Config.Bots.Names shuffled; numbered repeats
+-- only if there are more bots than names.
+local function botNames(rng: Random, count: number): { string }
+	local pool = table.clone(Config.Bots.Names)
+	if #pool == 0 then
+		pool = { "Det. Unknown" }
+	end
+	shuffle(pool, rng)
+	local names: { string } = table.create(count)
+	for index = 1, count do
+		local base = pool[(index - 1) % #pool + 1]
+		local lap = (index - 1) // #pool
+		names[index] = if lap == 0 then base else `{base} {lap + 1}`
+	end
+	return names
+end
+
 function Match.new(params: MatchParams): Match
+	local rng = Random.new()
+	local room = RoomController.new(params.room, params.slot)
 	local records: { PlayerRecord } = {}
 	local byPlayer: { [Player]: PlayerRecord } = {}
-	for index, player in params.players do
-		local record: PlayerRecord = {
-			player = player,
-			userId = player.UserId,
-			name = player.DisplayName,
-			seat = index,
-			status = "Active",
-			roundWins = 0,
-			acceptedCount = 0,
-			wasCaller = false,
-			reseatPending = false,
-			lobbyTarget = nil,
-			characterConnection = nil,
-		}
-		records[index] = record
+	for _, player in params.players do
+		local record = newRecord(player.UserId, player.DisplayName, player)
+		table.insert(records, record)
 		byPlayer[player] = record
+	end
+
+	-- Bots only fill seats that exist (a smaller template never stacks bots).
+	local botCount = #params.botIds
+	local seatCount = room:getSeatCount()
+	if seatCount > 0 then
+		local free = math.max(seatCount - #records, 0)
+		if botCount > free then
+			warn(`[Match {params.room.Name}] only {seatCount} seats: {botCount - free} AI detective(s) left out`)
+			botCount = free
+		end
+	end
+	local names = botNames(rng, botCount)
+	for index = 1, botCount do
+		table.insert(records, newRecord(params.botIds[index], names[index], nil))
+	end
+
+	-- Humans and bots shuffled together, spread evenly around the table.
+	shuffle(records, rng)
+	local seats = room:spreadSeats(#records)
+	local bySeat: { [number]: PlayerRecord } = {}
+	for index, record in records do
+		record.index = index
+		record.seat = seats[index]
+		bySeat[record.seat] = record
 	end
 
 	local self: MatchData = {
@@ -294,12 +386,17 @@ function Match.new(params: MatchParams): Match
 		slot = params.slot,
 		queueIndex = params.queueIndex,
 		roomName = params.room.Name,
-		room = RoomController.new(params.room, params.slot),
+		room = room,
 		params = params,
-		rng = Random.new(),
+		rng = rng,
 
 		records = records,
 		byPlayer = byPlayer,
+		bySeat = bySeat,
+		hasBots = botCount > 0,
+		botFolder = nil,
+		botsPending = 0,
+		botThreads = {},
 
 		-- "INTRO" with version 0 means "loading": nothing has been sent yet
 		-- and every remote handler rejects input until the real INTRO.
@@ -354,10 +451,19 @@ end
 -- Queries
 ----------------------------------------------------------------------------
 
+-- Bots are always connected; humans until they leave.
 function Match.isConnected(_self: Match, record: PlayerRecord): boolean
-	return record.status ~= "Left" and record.player.Parent ~= nil
+	if record.status == "Left" then
+		return false
+	end
+	local player = record.player
+	if player then
+		return player.Parent ~= nil
+	end
+	return record.isBot
 end
 
+-- Connected participants, bots included (what MinPlayersToContinue counts).
 function Match.countConnected(self: Match): number
 	local count = 0
 	for _, record in self.records do
@@ -366,6 +472,44 @@ function Match.countConnected(self: Match): number
 		end
 	end
 	return count
+end
+
+function Match.countConnectedHumans(self: Match): number
+	local count = 0
+	for _, record in self.records do
+		if not record.isBot and self:isConnected(record) then
+			count += 1
+		end
+	end
+	return count
+end
+
+-- The humanoid that represents `record` in the world right now, if any.
+function Match.humanoidOf(_self: Match, record: PlayerRecord): Humanoid?
+	local player = record.player
+	if player then
+		return CharacterUtil.getHumanoid(player)
+	end
+	local rig = record.rig
+	return if rig then rig:getHumanoid() else nil
+end
+
+-- The participant whose character owns `humanoid`, if any.
+function Match.recordOfHumanoid(self: Match, humanoid: Humanoid): PlayerRecord?
+	local character = humanoid.Parent
+	if character and character:IsA("Model") then
+		local player = Players:GetPlayerFromCharacter(character)
+		if player then
+			return self.byPlayer[player]
+		end
+	end
+	for _, record in self.records do
+		local rig = record.rig
+		if rig and rig.humanoid == humanoid then
+			return record
+		end
+	end
+	return nil
 end
 
 -- Active answerers this round (everyone Active except the Caller), plus the
@@ -410,6 +554,7 @@ function Match.buildSnapshot(self: Match): Remotes.MatchSnapshot
 			status = record.status,
 			roundWins = record.roundWins,
 			acceptedCount = record.acceptedCount,
+			isBot = record.isBot,
 		})
 	end
 
@@ -476,16 +621,18 @@ function Match.pushSnapshot(self: Match)
 	local snapshot = self:buildSnapshot()
 	self.lastSnapshot = snapshot
 	for _, record in self.records do
-		if self:isConnected(record) then
-			Remotes.MatchSnapshot:FireClient(record.player, snapshot)
+		local player = record.player
+		if player and self:isConnected(record) then
+			Remotes.MatchSnapshot:FireClient(player, snapshot)
 		end
 	end
 end
 
 function Match.fireEvent(self: Match, event: Remotes.MatchEvent)
 	for _, record in self.records do
-		if self:isConnected(record) then
-			Remotes.MatchEvent:FireClient(record.player, event)
+		local player = record.player
+		if player and self:isConnected(record) then
+			Remotes.MatchEvent:FireClient(player, event)
 		end
 	end
 end
@@ -599,6 +746,7 @@ function Match.transition(self: Match, newState: MatchState, endsAt: number?)
 	end
 	self:refreshTV()
 	self:pushSnapshot()
+	self:driveBots(newState)
 end
 
 function Match.run(self: Match)
@@ -625,6 +773,12 @@ end
 -- One loop iteration: global population rules first, then the current state.
 function Match.step(self: Match, now: number)
 	local state = self.state
+	-- Bots never play to an empty house: no humans left means CLEANUP now.
+	if self:countConnectedHumans() == 0 then
+		self:log("no humans left: cleanup")
+		self:cleanup()
+		return
+	end
 	if state == "GAME_END" then
 		if self:timeUp(now) then
 			self:cleanup()
@@ -633,11 +787,6 @@ function Match.step(self: Match, now: number)
 	end
 
 	local connected = self:countConnected()
-	if connected == 0 then
-		self:log("nobody left: cleanup")
-		self:cleanup()
-		return
-	end
 	if connected < Config.Match.MinPlayersToContinue then
 		self:endEarly(now)
 		return
@@ -685,19 +834,25 @@ end
 
 function Match.loadPlayers(self: Match)
 	for _, record in self.records do
-		-- Nobody wanders out of the elevator while the room streams in.
-		CharacterUtil.lockMovement(record.player)
-		record.characterConnection = record.player.CharacterAdded:Connect(function(character: Model)
-			self:onCharacterAdded(record, character)
-		end)
+		local player = record.player
+		if player then
+			-- Nobody wanders out of the elevator while the room streams in.
+			CharacterUtil.lockMovement(player)
+			record.characterConnection = player.CharacterAdded:Connect(function(character: Model)
+				self:onCharacterAdded(record, character)
+			end)
+		end
 	end
 
+	local botsStarted = serverNow()
+	self:startBotBodies()
 	self:streamRoom()
 	self:waitForCharacters()
+	self:finishBotBodies(botsStarted + BOT_BUILD_TIMEOUT)
 
 	self.totalRounds = if Config.Match.RoundsPerMatch > 0
 		then Config.Match.RoundsPerMatch
-		else math.max(self:countConnected(), 1)
+		else math.max(self:countConnectedHumans(), 1)
 
 	self.seatingEnabled = true
 	for _, record in self.records do
@@ -715,15 +870,16 @@ end
 function Match.streamRoom(self: Match)
 	local pending = 0
 	for _, record in self.records do
-		if record.status ~= "Left" then
+		local player = record.player
+		if player and record.status ~= "Left" then
 			pending += 1
-			local target = self.room:seatPosition(record.seat)
+			local target = self:standPosition(record)
 			task.spawn(function()
 				local ok, err = pcall(function()
-					record.player:RequestStreamAroundAsync(target, STREAM_TIMEOUT)
+					player:RequestStreamAroundAsync(target, STREAM_TIMEOUT)
 				end)
 				if not ok then
-					self:log(`stream request for {record.player.Name} failed: {err}`)
+					self:log(`stream request for {player.Name} failed: {err}`)
 				end
 				pending -= 1
 			end)
@@ -735,12 +891,17 @@ function Match.streamRoom(self: Match)
 	end
 end
 
+local function isMissing(record: PlayerRecord): boolean
+	local player = record.player
+	return player ~= nil and record.status ~= "Left" and not CharacterUtil.isAlive(player)
+end
+
 function Match.waitForCharacters(self: Match)
 	local deadline = serverNow() + Config.Match.CharacterWaitSeconds
 	while serverNow() < deadline do
 		local missing = false
 		for _, record in self.records do
-			if record.status ~= "Left" and not CharacterUtil.isAlive(record.player) then
+			if isMissing(record) then
 				missing = true
 				break
 			end
@@ -751,7 +912,7 @@ function Match.waitForCharacters(self: Match)
 		task.wait(CHARACTER_POLL)
 	end
 	for _, record in self.records do
-		if record.status ~= "Left" and not CharacterUtil.isAlive(record.player) then
+		if isMissing(record) then
 			self:dropUnloaded(record)
 		end
 	end
@@ -760,17 +921,102 @@ end
 -- A player whose character never appeared counts as Left and is handed back
 -- to the lobby systems (they can queue again).
 function Match.dropUnloaded(self: Match, record: PlayerRecord)
-	warn(`[Match {self.roomName}] {record.player.Name} never loaded a character; treating as Left`)
+	local player = record.player
+	if not player then
+		return
+	end
+	warn(`[Match {self.roomName}] {player.Name} never loaded a character; treating as Left`)
 	record.status = "Left"
 	if record.characterConnection then
 		record.characterConnection:Disconnect()
 		record.characterConnection = nil
 	end
-	self.room:getModel():RemovePersistentPlayer(record.player)
-	self.params.releasePlayer(record.player)
-	CharacterUtil.unlockMovement(record.player)
-	if record.player.Parent then
-		Remotes.Notify:FireClient(record.player, "Couldn't load you into the interrogation room.", "Error")
+	self.room:getModel():RemovePersistentPlayer(player)
+	self.params.releasePlayer(player)
+	CharacterUtil.unlockMovement(player)
+	if player.Parent then
+		Remotes.Notify:FireClient(player, "Couldn't load you into the interrogation room.", "Error")
+	end
+end
+
+----------------------------------------------------------------------------
+-- Bot bodies
+----------------------------------------------------------------------------
+
+-- Where a participant stands when not seated in a Seat (spawn point of a
+-- bot body, fallback when the room has fewer seats than participants).
+function Match.standPosition(self: Match, record: PlayerRecord): Vector3
+	local seat = self.room:getSeat(record.seat)
+	if seat then
+		return seat.Position
+	end
+	local count = math.max(#self.records, 1)
+	local angle = (record.index - 1) / count * 2 * math.pi
+	return self.room:getOrigin() + Vector3.new(math.cos(angle) * STAND_RADIUS, 0, math.sin(angle) * STAND_RADIUS)
+end
+
+function Match.ensureBotFolder(self: Match): Folder
+	local existing = self.botFolder
+	if existing then
+		return existing
+	end
+	local folder = Instance.new("Folder")
+	folder.Name = BOTS_FOLDER
+	folder.Parent = self.room:getModel()
+	self.botFolder = folder
+	return folder
+end
+
+-- Starts building every bot's engine body in parallel (each call yields).
+-- A body that arrives after its block-rig fallback or after cleanup is
+-- destroyed on arrival.
+function Match.startBotBodies(self: Match)
+	if not self.hasBots then
+		return
+	end
+	local folder = self:ensureBotFolder()
+	for _, record in self.records do
+		if record.isBot then
+			self.botsPending += 1
+			local description = BotRig.randomDescription(self.rng)
+			task.spawn(function()
+				local model = BotRig.modelFromDescription(description)
+				self.botsPending -= 1
+				if not model then
+					return
+				end
+				if self.closed or record.rig ~= nil then
+					model:Destroy()
+					return
+				end
+				record.rig = BotRig.new(model, record.name, folder, CFrame.new(self:standPosition(record)))
+			end)
+		end
+	end
+end
+
+-- Waits (until `deadline`) for the engine bodies, then gives every bot that
+-- still has none a block rig. Never leaves a bot without a body.
+function Match.finishBotBodies(self: Match, deadline: number)
+	if not self.hasBots then
+		return
+	end
+	while self.botsPending > 0 and serverNow() < deadline do
+		task.wait(CHARACTER_POLL)
+	end
+	local folder = self:ensureBotFolder()
+	for _, record in self.records do
+		if record.isBot and record.rig == nil then
+			local model = BotRig.blockModel(BotRig.randomDescription(self.rng))
+			record.rig = BotRig.new(model, record.name, folder, CFrame.new(self:standPosition(record)))
+		end
+	end
+end
+
+function Match.animate(_self: Match, record: PlayerRecord, name: BotRig.AnimationName)
+	local rig = record.rig
+	if rig then
+		rig:play(name)
 	end
 end
 
@@ -780,24 +1026,46 @@ end
 
 function Match.sendToLounge(self: Match, record: PlayerRecord)
 	local spawnPart = self.room:spectatorSpawnFor(record.userId)
-	if spawnPart then
-		CharacterUtil.teleport(record.player, spawnPart.CFrame)
-	else
-		warn(`[Match {self.roomName}] no spectator spawn for {record.player.Name}`)
+	local target = if spawnPart then spawnPart.CFrame else nil
+	if not target then
+		warn(`[Match {self.roomName}] no spectator spawn for {record.name}`)
 	end
-	CharacterUtil.unlockMovement(record.player)
+	local player = record.player
+	if player then
+		if target then
+			CharacterUtil.teleport(player, target)
+		end
+		CharacterUtil.unlockMovement(player)
+		return
+	end
+	local rig = record.rig
+	if rig then
+		rig:teleport(target or CFrame.new(self:standPosition(record)))
+	end
 end
 
--- Puts a player where their status says they belong: Active -> their seat
--- (movement locked), Eliminated -> the spectator lounge (free to walk).
+-- Puts a participant where their status says they belong: Active -> their
+-- seat (movement locked), Eliminated -> the spectator lounge (free to walk).
 function Match.placeRecord(self: Match, record: PlayerRecord)
 	if record.status == "Active" then
-		CharacterUtil.lockMovement(record.player)
 		local seat = self.room:getSeat(record.seat)
-		if seat then
-			CharacterUtil.seat(record.player, seat)
-		else
-			CharacterUtil.teleport(record.player, CFrame.new(self.room:seatPosition(record.seat)))
+		local player = record.player
+		if player then
+			CharacterUtil.lockMovement(player)
+			if seat then
+				CharacterUtil.seat(player, seat)
+			else
+				CharacterUtil.teleport(player, CFrame.new(self:standPosition(record)))
+			end
+			return
+		end
+		local rig = record.rig
+		if rig then
+			if seat then
+				rig:seat(seat)
+			else
+				rig:teleport(CFrame.new(self:standPosition(record)))
+			end
 		end
 	elseif record.status == "Eliminated" then
 		self:sendToLounge(record)
@@ -805,7 +1073,8 @@ function Match.placeRecord(self: Match, record: PlayerRecord)
 end
 
 function Match.onCharacterAdded(self: Match, record: PlayerRecord, character: Model)
-	if self.closed or not self.seatingEnabled or record.status == "Left" then
+	local player = record.player
+	if not player or self.closed or not self.seatingEnabled or record.status == "Left" then
 		return
 	end
 	local root = CharacterUtil.waitForRoot(character, RESPAWN_ROOT_WAIT)
@@ -813,10 +1082,10 @@ function Match.onCharacterAdded(self: Match, record: PlayerRecord, character: Mo
 		return
 	end
 	task.wait(RESPAWN_SETTLE)
-	if self.closed or not self.seatingEnabled or hasLeft(record) or record.player.Character ~= character then
+	if self.closed or not self.seatingEnabled or hasLeft(record) or player.Character ~= character then
 		return
 	end
-	self:log(`{record.player.Name} respawned; placing ({record.status})`)
+	self:log(`{player.Name} respawned; placing ({record.status})`)
 	self:placeRecord(record)
 end
 
@@ -831,34 +1100,29 @@ function Match.scheduleReseat(self: Match, record: PlayerRecord)
 			return
 		end
 		local seat = self.room:getSeat(record.seat)
-		local humanoid = CharacterUtil.getHumanoid(record.player)
+		local humanoid = self:humanoidOf(record)
 		if seat and humanoid and seat.Occupant ~= humanoid then
-			CharacterUtil.lockMovement(record.player)
-			CharacterUtil.seat(record.player, seat)
+			self:placeRecord(record)
 		end
 	end)
 end
 
--- Seat watchdog: an active player who stands up (jump, physics glitch) is
--- re-seated shortly after; anybody else sitting in a match seat is ejected.
+-- Seat watchdog: an active participant who stands up (jump, physics glitch)
+-- is re-seated shortly after; anybody else sitting in a match seat is ejected.
 function Match.onSeatOccupantChanged(self: Match, seatNumber: number, seat: Seat)
 	if self.closed or not self.seatingEnabled then
 		return
 	end
-	local owner = self.records[seatNumber]
+	local owner = self.bySeat[seatNumber]
 	local occupant = seat.Occupant
 	if occupant then
-		local ownerHumanoid = if owner and owner.status == "Active"
-			then CharacterUtil.getHumanoid(owner.player)
-			else nil
+		local ownerHumanoid = if owner and owner.status == "Active" then self:humanoidOf(owner) else nil
 		if occupant == ownerHumanoid then
 			return
 		end
 		CharacterUtil.unseatHumanoid(occupant)
-		local character = occupant.Parent
-		local intruder = if character and character:IsA("Model") then Players:GetPlayerFromCharacter(character) else nil
-		local intruderRecord = if intruder then self.byPlayer[intruder] else nil
-		self:log(`ejected {if intruder then intruder.Name else "a humanoid"} from seat {seatNumber}`)
+		local intruderRecord = self:recordOfHumanoid(occupant)
+		self:log(`ejected {if intruderRecord then intruderRecord.name else "a humanoid"} from seat {seatNumber}`)
 		if intruderRecord and intruderRecord.status == "Active" then
 			self:scheduleReseat(intruderRecord) -- a participant in the wrong seat goes back to their own
 		end
@@ -885,47 +1149,77 @@ end
 -- Rounds
 ----------------------------------------------------------------------------
 
+-- Caller eligibility passes, most preferred first. With two or more humans:
+-- humans who haven't called, then anyone who hasn't (bots), then humans,
+-- then anyone. With one human (solo play): bots who haven't called, then
+-- bots, then anyone (only if no bot is left, which cannot normally happen).
+type CallerPass = (record: PlayerRecord) -> boolean
+
+local MULTI_HUMAN_PASSES: { CallerPass } = {
+	function(record)
+		return not record.isBot and not record.wasCaller
+	end,
+	function(record)
+		return not record.wasCaller
+	end,
+	function(record)
+		return not record.isBot
+	end,
+	function(_record)
+		return true
+	end,
+}
+local SOLO_PASSES: { CallerPass } = {
+	function(record)
+		return record.isBot and not record.wasCaller
+	end,
+	function(record)
+		return record.isBot
+	end,
+	function(_record)
+		return true
+	end,
+}
+
 function Match.chooseCaller(self: Match): PlayerRecord?
 	local records = self.records
-	local previous = self.caller
-	if not previous then
-		local candidates: { PlayerRecord } = {}
-		for _, record in records do
-			if self:isConnected(record) then
-				table.insert(candidates, record)
-			end
-		end
-		if #candidates == 0 then
-			return nil
-		end
-		return candidates[self.rng:NextInteger(1, #candidates)]
-	end
-
-	-- Clockwise from the previous Caller: first connected player who has not
-	-- called yet; if everyone has, simply the next connected player.
 	local count = #records
-	local fallback: PlayerRecord? = nil
-	for offset = 1, count do
-		local record = records[(previous.seat - 1 + offset) % count + 1]
-		if self:isConnected(record) then
-			if not record.wasCaller then
-				return record
+	local passes: { CallerPass } = if self:countConnectedHumans() <= 1 then SOLO_PASSES else MULTI_HUMAN_PASSES
+	local previous = self.caller
+	for _, pass in passes do
+		if not previous then
+			-- Round 1: uniformly random among the preferred candidates.
+			local candidates: { PlayerRecord } = {}
+			for _, record in records do
+				if self:isConnected(record) and pass(record) then
+					table.insert(candidates, record)
+				end
 			end
-			fallback = fallback or record
+			if #candidates > 0 then
+				return candidates[self.rng:NextInteger(1, #candidates)]
+			end
+		else
+			-- Later rounds: clockwise from the previous Caller (who comes last).
+			for offset = 1, count do
+				local record = records[(previous.index - 1 + offset) % count + 1]
+				if self:isConnected(record) and pass(record) then
+					return record
+				end
+			end
 		end
 	end
-	return fallback
+	return nil
 end
 
--- Answerers in seat order starting with the seat LEFT of the Caller (the
--- next seat number), wrapping around.
+-- Answerers in clockwise order starting with the participant LEFT of the
+-- Caller (the next one around the table), wrapping around.
 function Match.buildTurnOrder(self: Match): { PlayerRecord }
 	local order: { PlayerRecord } = {}
 	local caller = self.caller
 	local count = #self.records
-	local callerSeat = if caller then caller.seat else 0
+	local callerIndex = if caller then caller.index else 0
 	for offset = 1, count do
-		local record = self.records[(callerSeat - 1 + offset) % count + 1]
+		local record = self.records[(callerIndex - 1 + offset) % count + 1]
 		if record ~= caller and record.status == "Active" then
 			table.insert(order, record)
 		end
@@ -1341,18 +1635,19 @@ end
 function Match.prepareLobbyReturn(self: Match)
 	local connected: { PlayerRecord } = {}
 	for _, record in self.records do
-		if self:isConnected(record) then
+		if record.player and self:isConnected(record) then
 			table.insert(connected, record)
 		end
 	end
 	local targets = self.params.lobbyTargets(#connected)
 	for index, record in connected do
 		local target = targets[index]
+		local player = record.player
 		record.lobbyTarget = target
-		if target then
+		if target and player then
 			task.spawn(function()
 				pcall(function()
-					record.player:RequestStreamAroundAsync(target.Position, STREAM_TIMEOUT)
+					player:RequestStreamAroundAsync(target.Position, STREAM_TIMEOUT)
 				end)
 			end)
 		end
@@ -1376,6 +1671,155 @@ function Match.enterGameEnd(self: Match, now: number)
 end
 
 ----------------------------------------------------------------------------
+-- AI detectives: thinking and acting
+----------------------------------------------------------------------------
+
+-- Drops finished threads from the tracking list.
+function Match.pruneBotThreads(self: Match)
+	local threads = self.botThreads
+	for index = #threads, 1, -1 do
+		if coroutine.status(threads[index]) == "dead" then
+			table.remove(threads, index)
+		end
+	end
+end
+
+-- Runs `act` in a tracked thread after `seconds`, but only if the match is
+-- still open and `stillValid()` (state / round / turn identity) still holds
+-- when the wait is over.
+function Match.botAfter(self: Match, seconds: number, stillValid: () -> boolean, act: () -> ())
+	self:pruneBotThreads()
+	local thread = task.spawn(function()
+		task.wait(seconds)
+		if self.closed or not stillValid() then
+			return
+		end
+		act()
+	end)
+	table.insert(self.botThreads, thread)
+end
+
+function Match.cancelBotThreads(self: Match)
+	local running = coroutine.running()
+	for _, thread in self.botThreads do
+		if thread ~= running and coroutine.status(thread) == "suspended" then
+			task.cancel(thread)
+		end
+	end
+	table.clear(self.botThreads)
+end
+
+-- Called after every transition: schedules whatever the bots do in `state`.
+function Match.driveBots(self: Match, state: MatchState)
+	if self.closed or not self.hasBots then
+		return
+	end
+	if state == "INTRO" then
+		for _, record in self.records do
+			if record.isBot and self.rng:NextNumber() < WAVE_CHANCE then
+				self:botAfter(BotBrain.inRange(self.rng, WAVE_DELAY), function()
+					return self.state == "INTRO"
+				end, function()
+					self:animate(record, "Wave")
+				end)
+			end
+		end
+	elseif state == "CATEGORY_SELECTION" then
+		local caller = self.caller
+		if caller and caller.isBot then
+			self:botPickCategory(caller)
+		end
+	elseif state == "PLAYING" then
+		local turn = self.turn
+		if turn and turn.record.isBot then
+			self:botAnswer(turn)
+		end
+	elseif state == "JUDGING" then
+		local caller = self.caller
+		local judging = self.judging
+		if caller and caller.isBot and judging and not self.autoJudge then
+			self:botJudge(caller, judging)
+		end
+	elseif state == "ELIMINATION" then
+		self:botReactToElimination()
+	elseif state == "ROUND_END" then
+		local winner = self.roundWinner
+		if winner and winner.isBot then
+			self:animate(winner, "Cheer")
+		end
+	elseif state == "GAME_END" then
+		local winners: { number } = self.winnerUserIds or {}
+		for _, userId in winners do
+			for _, record in self.records do
+				if record.isBot and record.userId == userId then
+					self:animate(record, "Cheer")
+				end
+			end
+		end
+	end
+end
+
+function Match.botPickCategory(self: Match, caller: PlayerRecord)
+	local round = self.round
+	local now = serverNow()
+	local delay = BotBrain.delayWithin(self.rng, Config.Bots.CategoryDelay, now, self.stateEndsAt or now)
+	self:botAfter(delay, function()
+		return self.state == "CATEGORY_SELECTION" and self.round == round and self.caller == caller
+	end, function()
+		self:submitCategoryFrom(caller, BotBrain.pickCategory(self.rng))
+	end)
+end
+
+function Match.botAnswer(self: Match, turn: Turn)
+	local record = turn.record
+	local delay = BotBrain.answerWait(self.rng, serverNow(), turn.startsAt, turn.endsAt)
+	self:botAfter(delay, function()
+		return self.state == "PLAYING" and self.turn == turn and record.status == "Active"
+	end, function()
+		local text = BotBrain.chooseAnswer(self.rng, self.category, self.accepted, self.acceptedKeys)
+		if text then
+			self:submitAnswerFrom(record, turn.id, text)
+		end
+	end)
+end
+
+function Match.botJudge(self: Match, caller: PlayerRecord, judging: Judging)
+	local delay = BotBrain.delayWithin(self.rng, Config.Bots.JudgeDelay, serverNow(), judging.deadline)
+	self:botAfter(delay, function()
+		return self.state == "JUDGING" and self.judging == judging and self.caller == caller and not self.autoJudge
+	end, function()
+		local verdict: Verdict = BotBrain.judge(self.rng, self.category, judging.answer)
+		self:judgeAnswerFrom(caller, judging.turnId, verdict)
+		if verdict == "Wrong" and self.rng:NextNumber() < POINT_CHANCE then
+			self:animate(caller, "Point")
+		end
+	end)
+end
+
+-- Now and then one of the other bots chuckles at an elimination.
+function Match.botReactToElimination(self: Match)
+	local elimination = self.elimination
+	if not elimination or self.rng:NextNumber() >= LAUGH_CHANCE then
+		return
+	end
+	local candidates: { PlayerRecord } = {}
+	for _, record in self.records do
+		if record.isBot and record ~= elimination.record and record.status ~= "Left" then
+			table.insert(candidates, record)
+		end
+	end
+	if #candidates == 0 then
+		return
+	end
+	local laugher = candidates[self.rng:NextInteger(1, #candidates)]
+	self:botAfter(BotBrain.inRange(self.rng, LAUGH_DELAY), function()
+		return self.state == "ELIMINATION"
+	end, function()
+		self:animate(laugher, "Laugh")
+	end)
+end
+
+----------------------------------------------------------------------------
 -- Cleanup
 ----------------------------------------------------------------------------
 
@@ -1389,7 +1833,7 @@ end
 function Match.returnPlayersToLobby(self: Match)
 	local needTargets: { PlayerRecord } = {}
 	for _, record in self.records do
-		if self:isConnected(record) and not record.lobbyTarget then
+		if record.player and self:isConnected(record) and not record.lobbyTarget then
 			table.insert(needTargets, record)
 		end
 	end
@@ -1399,8 +1843,8 @@ function Match.returnPlayersToLobby(self: Match)
 	end
 
 	for _, record in self.records do
-		if self:isConnected(record) then
-			local player = record.player
+		local player = record.player
+		if player and self:isConnected(record) then
 			local target = record.lobbyTarget
 			if target and CharacterUtil.teleport(player, target) then
 				CharacterUtil.unlockMovement(player)
@@ -1416,19 +1860,20 @@ function Match.returnPlayersToLobby(self: Match)
 	end
 end
 
--- Ends the match for good. Order matters: final CLEANUP snapshot first (the
--- clients switch back to lobby mode), then the lobby teleport, then the
--- membership release, then connections, the room and finally the slot.
--- Idempotent and safe to call from the crash handler.
+-- Ends the match for good. Order matters: bot threads stop first, then the
+-- final CLEANUP snapshot (the clients switch back to lobby mode), the lobby
+-- teleport, the membership release, the bot bodies, connections, the room
+-- and finally the slot. Idempotent and safe to call from the crash handler.
 function Match.cleanup(self: Match)
 	if self.closed then
 		return
 	end
-	self.closed = true -- stops the loop and makes every in-flight handler bail out
+	self.closed = true -- stops the loop and makes every in-flight handler / bot thread bail out
 	self.seatingEnabled = false
 	self.turn = nil
 	self.judging = nil
 	self.musicStartTime = nil
+	self:cancelBotThreads()
 
 	safely(self, "final snapshot", function()
 		self:transition("CLEANUP", nil)
@@ -1441,9 +1886,19 @@ function Match.cleanup(self: Match)
 			record.characterConnection:Disconnect()
 			record.characterConnection = nil
 		end
-		safely(self, "release player", function()
-			self.params.releasePlayer(record.player)
-		end)
+		local player = record.player
+		if player then
+			safely(self, "release player", function()
+				self.params.releasePlayer(player)
+			end)
+		end
+		local rig = record.rig
+		if rig then
+			record.rig = nil
+			safely(self, "destroy bot", function()
+				rig:destroy()
+			end)
+		end
 	end
 	for _, connection in self.connections do
 		connection:Disconnect()
@@ -1452,21 +1907,48 @@ function Match.cleanup(self: Match)
 	safely(self, "destroy room", function()
 		self.room:destroy()
 	end)
+	self.botFolder = nil
 	safely(self, "free slot", self.params.onClosed)
 	self:log("closed")
 end
 
 ----------------------------------------------------------------------------
--- Remote input (validated by MatchService for types; validated here for
--- role, state, turn and timing). Handlers only RECORD; the loop acts.
+-- Input (validated by MatchService for types; validated here for role,
+-- state, turn and timing). Humans arrive through the remotes (the Player
+-- wrappers); bots call the *From paths directly with the same checks.
+-- Handlers only RECORD; the loop acts.
 ----------------------------------------------------------------------------
 
+local function rejectInput(record: PlayerRecord, what: "Answer" | "Category", reason: string)
+	local player = record.player
+	if player and player.Parent then
+		Remotes.InputRejected:FireClient(player, what, reason)
+	end
+end
+
+-- Broadcast filtering for a participant's text. Bot text comes from the
+-- server's own WordBank, so it is passed through without a (yielding) call.
+local function filterFor(record: PlayerRecord, text: string): (boolean, string)
+	local player = record.player
+	if record.isBot or not player then
+		return true, text
+	end
+	return TextFilter.forBroadcast(text, player.UserId)
+end
+
 function Match.submitCategory(self: Match, player: Player, text: string)
+	local record = self.byPlayer[player]
+	if record then
+		self:submitCategoryFrom(record, text)
+	end
+end
+
+function Match.submitCategoryFrom(self: Match, record: PlayerRecord, text: string)
 	if self.closed or self.state ~= "CATEGORY_SELECTION" then
 		return
 	end
 	local caller = self.caller
-	if not caller or caller.player ~= player or caller.status == "Left" then
+	if not caller or caller ~= record or caller.status == "Left" then
 		return
 	end
 	if self.category ~= nil or self.pendingCategory ~= nil or self.categorySubmitting then
@@ -1475,13 +1957,13 @@ function Match.submitCategory(self: Match, player: Player, text: string)
 
 	local ok, cleanedOrReason = AnswerRules.validateCategory(text)
 	if not ok then
-		Remotes.InputRejected:FireClient(player, "Category", cleanedOrReason)
+		rejectInput(record, "Category", cleanedOrReason)
 		return
 	end
 
 	local round = self.round
 	self.categorySubmitting = true
-	local filterOk, filtered = TextFilter.forBroadcast(cleanedOrReason, player.UserId)
+	local filterOk, filtered = filterFor(record, cleanedOrReason)
 	-- Anything may have happened while the filter yielded.
 	if self.closed or self.round ~= round or self.state ~= "CATEGORY_SELECTION" then
 		return
@@ -1491,19 +1973,26 @@ function Match.submitCategory(self: Match, player: Player, text: string)
 	if not filterOk then
 		self.pendingCategory = { text = self:fallbackCategory(), notice = NOTICE_FILTER_CATEGORY }
 	elseif AnswerRules.wasCensored(cleanedOrReason, filtered) then
-		Remotes.InputRejected:FireClient(player, "Category", REJECT_CENSORED_CATEGORY)
+		rejectInput(record, "Category", REJECT_CENSORED_CATEGORY)
 	else
 		self.pendingCategory = { text = filtered, notice = nil }
 	end
 end
 
 function Match.submitAnswer(self: Match, player: Player, turnId: number, text: string)
+	local record = self.byPlayer[player]
+	if record then
+		self:submitAnswerFrom(record, turnId, text)
+	end
+end
+
+function Match.submitAnswerFrom(self: Match, record: PlayerRecord, turnId: number, text: string)
 	local arrivedAt = serverNow()
 	if self.closed or self.state ~= "PLAYING" then
 		return
 	end
 	local turn = self.turn
-	if not turn or turn.id ~= turnId or turn.record.player ~= player or turn.record.status ~= "Active" then
+	if not turn or turn.id ~= turnId or turn.record ~= record or record.status ~= "Active" then
 		return
 	end
 	if turn.submitting or turn.result ~= nil then
@@ -1515,7 +2004,7 @@ function Match.submitAnswer(self: Match, player: Player, turnId: number, text: s
 
 	local ok, cleanedOrReason = AnswerRules.validateAnswer(text)
 	if not ok then
-		Remotes.InputRejected:FireClient(player, "Answer", cleanedOrReason)
+		rejectInput(record, "Answer", cleanedOrReason)
 		return
 	end
 	local cleaned = cleanedOrReason
@@ -1529,7 +2018,7 @@ function Match.submitAnswer(self: Match, player: Player, turnId: number, text: s
 	end
 
 	turn.submitting = true
-	local filterOk, filtered = TextFilter.forBroadcast(cleaned, player.UserId)
+	local filterOk, filtered = filterFor(record, cleaned)
 	if self.closed or self.state ~= "PLAYING" or self.turn ~= turn then
 		return -- the turn ended while we were filtering (left, voided, match over)
 	end
@@ -1540,7 +2029,7 @@ function Match.submitAnswer(self: Match, player: Player, turnId: number, text: s
 		return
 	end
 	if AnswerRules.wasCensored(cleaned, filtered) then
-		Remotes.InputRejected:FireClient(player, "Answer", REJECT_CENSORED_ANSWER)
+		rejectInput(record, "Answer", REJECT_CENSORED_ANSWER)
 		return -- may retry while the turn lasts
 	end
 	local repeatedLate = self.acceptedKeys[key]
@@ -1552,6 +2041,13 @@ function Match.submitAnswer(self: Match, player: Player, turnId: number, text: s
 end
 
 function Match.judgeAnswer(self: Match, player: Player, turnId: number, verdict: Verdict)
+	local record = self.byPlayer[player]
+	if record then
+		self:judgeAnswerFrom(record, turnId, verdict)
+	end
+end
+
+function Match.judgeAnswerFrom(self: Match, record: PlayerRecord, turnId: number, verdict: Verdict)
 	local arrivedAt = serverNow()
 	if self.closed or self.state ~= "JUDGING" or self.autoJudge then
 		return
@@ -1561,7 +2057,7 @@ function Match.judgeAnswer(self: Match, player: Player, turnId: number, verdict:
 		return
 	end
 	local caller = self.caller
-	if not caller or caller.player ~= player or caller.status == "Left" then
+	if not caller or caller ~= record or caller.status == "Left" then
 		return
 	end
 	if arrivedAt > judging.deadline + Config.Turn.LatencyGraceSeconds then

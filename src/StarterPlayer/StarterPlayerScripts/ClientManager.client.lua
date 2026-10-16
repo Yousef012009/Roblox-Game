@@ -9,6 +9,9 @@
 	  4. routes: decides which screens are visible from (state, role, status),
 	     drives music / room FX / camera, and runs one RenderStepped loop that
 	     ticks the visible widgets (each only writes when something changed)
+	  5. drives the cinematic beats: elevator departure (DepartureFX), fades to
+	     and from black (ScreenFader), lobby music (LobbyMusic), victory
+	     dressing (VictoryFX) and the local character's emotes (LocalAnim)
 
 	Snapshots are versioned per matchId: older versions are ignored, a new
 	matchId replaces the current match, and matches that already ended are
@@ -30,20 +33,26 @@ local AnswerBox = require(Client.AnswerBox)
 local CameraController = require(Client.CameraController)
 local CategoryPanel = require(Client.CategoryPanel)
 local ChantText = require(Client.ChantText)
+local DepartureFX = require(Client.DepartureFX)
 local EliminationOverlay = require(Client.EliminationOverlay)
 local GameHUD = require(Client.GameHUD)
 local InfoCard = require(Client.InfoCard)
 local IntroOverlay = require(Client.IntroOverlay)
 local JudgePanel = require(Client.JudgePanel)
 local LobbyFX = require(Client.LobbyFX)
+local LobbyMusic = require(Client.LobbyMusic)
+local LocalAnim = require(Client.LocalAnim)
 local Metronome = require(Client.Metronome)
 local MusicController = require(Client.MusicController)
-local QueueHUD = require(Client.QueueHUD)
+local PartyMenu = require(Client.PartyMenu)
 local RoomFX = require(Client.RoomFX)
+local ScreenFader = require(Client.ScreenFader)
 local SpectatorHUD = require(Client.SpectatorHUD)
 local State = require(Client.State)
+local TextFX = require(Client.TextFX)
 local Toasts = require(Client.Toasts)
 local UIKit = require(Client.UIKit)
+local VictoryFX = require(Client.VictoryFX)
 local VictoryScreen = require(Client.VictoryScreen)
 
 type Snapshot = Remotes.MatchSnapshot
@@ -53,6 +62,9 @@ local localPlayer = Players.LocalPlayer
 
 local ROOM_WAIT_SECONDS = 10
 local VICTIM_CAMERA_HOLD = 1.1 -- the victim sees the jolt in the room before the lounge cams
+local VICTIM_FADE_SECONDS = 0.3 -- fade to black just before the lounge cut
+local INTRO_FADE_IN_SECONDS = 0.9
+local WAVE_DELAY = 1.6 -- after CLEANUP: wait for the teleport before waving
 local MUSIC_STATES: { [string]: boolean } = {
 	COUNTDOWN = true,
 	PLAYING = true,
@@ -71,6 +83,8 @@ local roomName: string? = nil
 local spectatorCameraAfter = 0
 local matchControlsApplied = false
 local touchControlsBefore = true
+local victimFading = false -- the victim's fade to black (lounge cut) is in progress
+local lobbyToken = 0 -- invalidates a pending lobby-return wave
 
 ----------------------------------------------------------------------------
 -- UI construction
@@ -82,7 +96,9 @@ local function onTypingChanged(isTyping: boolean)
 	CameraController.setTyping(isTyping)
 end
 
-QueueHUD.mount(gui)
+ScreenFader.mount()
+PartyMenu.mount(gui)
+LobbyMusic.mount(gui)
 IntroOverlay.mount(gui)
 InfoCard.mount(gui)
 CategoryPanel.mount(gui, onTypingChanged)
@@ -92,7 +108,7 @@ ChantText.mount(gui)
 AnswerBox.mount(gui, onTypingChanged)
 JudgePanel.mount(gui)
 SpectatorHUD.mount(gui)
-VictoryScreen.mount(gui)
+VictoryScreen.mount(gui, CameraController.jolt) -- the CASE CLOSED stamp lands with a jolt
 EliminationOverlay.mount(gui)
 Toasts.mount(gui)
 UIKit.crtOverlay(gui)
@@ -160,6 +176,7 @@ local function resolveRoom(name: string?)
 			RoomFX.attach(model)
 			RoomFX.setSpectator(State.isSpectator())
 			CameraController.setRoom(model)
+			VictoryFX.enter() -- no-op unless the match is already at a victory screen
 		else
 			warn(`[ClientManager] room {name} did not stream in; UI continues without room FX`)
 		end
@@ -182,17 +199,38 @@ local function hideMatchScreens()
 	VictoryScreen.setVisible(false)
 end
 
+-- Waves once the character is back in the lobby (skipped if a new match began).
+local function waveOnReturn()
+	lobbyToken += 1
+	local myToken = lobbyToken
+	task.delay(WAVE_DELAY, function()
+		if myToken == lobbyToken and State.snapshot == nil then
+			LocalAnim.play("Wave")
+		end
+	end)
+end
+
 local function enterLobby()
+	local fromMatch = lastStateName ~= nil
 	hideMatchScreens()
 	EliminationOverlay.hide()
 	MusicController.stop()
+	VictoryFX.exit()
 	resolveRoom(nil)
 	CameraController.setMode("Lobby")
 	applyMatchControls(false)
 	setResetEnabled(true)
 	LobbyFX.setActive(true)
-	QueueHUD.setVisible(true)
+	PartyMenu.setVisible(true)
+	LobbyMusic.setLobby(true)
 	lastStateName = nil
+	if fromMatch then
+		victimFading = false
+		if ScreenFader.isDark() then
+			ScreenFader.fadeIn(0.6)
+		end
+		waveOnReturn()
+	end
 end
 
 local function cameraModeFor(stateName: string, spectator: boolean): CameraController.Mode
@@ -218,15 +256,15 @@ local function routeCards(snapshot: Snapshot, isCaller: boolean)
 		if isCaller then
 			InfoCard.show("YOU ARE THE CALLER", "YOU NAME THE CATEGORY AND JUDGE EVERY ANSWER", snapshot.stateEndsAt, UIKit.Colors.Amber)
 		else
-			local name = string.upper(State.nameOf(snapshot.callerUserId))
+			local name = State.tagName(snapshot.callerUserId)
 			InfoCard.show(`{name} IS THE CALLER`, "ANSWER ON THE BEAT. NO REPEATS. NO HESITATION.", snapshot.stateEndsAt)
 		end
 	elseif stateName == "CATEGORY_SELECTION" and not isCaller then
-		local name = string.upper(State.nameOf(snapshot.callerUserId))
+		local name = State.tagName(snapshot.callerUserId)
 		InfoCard.show(`{name} IS CHOOSING A CATEGORY...`, "STAND BY", snapshot.stateEndsAt)
 	elseif stateName == "JUDGING" and (not isCaller or snapshot.autoJudge) then
 		local judging = snapshot.judging
-		local body = if judging then `{string.upper(State.nameOf(judging.userId))}: "{judging.answer}"` else nil
+		local body = if judging then `{State.tagName(judging.userId)}: "{judging.answer}"` else nil
 		local title = if snapshot.autoJudge then "AUTO-JUDGING..." else "CALLER IS JUDGING"
 		InfoCard.show(title, body, if judging then judging.deadline else snapshot.stateEndsAt, UIKit.Colors.Amber)
 	else
@@ -250,10 +288,20 @@ local function route()
 		if stateName == "CATEGORY_SELECTION" then
 			CategoryPanel.reset()
 		end
+		if lastStateName == nil then
+			lobbyToken += 1 -- a pending lobby wave must not fire mid-match
+			LocalAnim.stop()
+		end
+		-- Arrived from the elevator (or joined late): lift the black.
+		if ScreenFader.isDark() and not victimFading then
+			ScreenFader.fadeIn(INTRO_FADE_IN_SECONDS)
+		end
 		lastStateName = stateName
 	end
 
-	QueueHUD.setVisible(false)
+	PartyMenu.setVisible(false)
+	LobbyMusic.setLobby(false)
+	DepartureFX.stop(false)
 	LobbyFX.setActive(false)
 	applyMatchControls(State.me ~= nil and not spectator)
 	setResetEnabled(false)
@@ -289,7 +337,13 @@ local function route()
 
 	JudgePanel.setVisible(stateName == "JUDGING" and isCaller and not snapshot.autoJudge and snapshot.judging ~= nil)
 	SpectatorHUD.setVisible(spectator and musicOn)
-	VictoryScreen.setVisible(stateName == "ROUND_END" or stateName == "GAME_END")
+	local victory = stateName == "ROUND_END" or stateName == "GAME_END"
+	VictoryScreen.setVisible(victory)
+	if victory then
+		VictoryFX.enter()
+	else
+		VictoryFX.exit()
+	end
 
 	routeCamera(snapshot)
 end
@@ -345,13 +399,20 @@ local function onMatchEvent(event: MatchEvent)
 		if event.userId == State.localUserId then
 			EliminationOverlay.showVictim(event.reason, event.answer)
 			CameraController.jolt()
-			-- The render loop switches to the lounge cameras once this passes.
+			-- The render loop switches to the lounge cameras once this passes;
+			-- a quick fade to black hides the cut (and the server's teleport).
 			spectatorCameraAfter = os.clock() + VICTIM_CAMERA_HOLD
+			victimFading = true
+			task.delay(VICTIM_CAMERA_HOLD - VICTIM_FADE_SECONDS, function()
+				if victimFading then
+					ScreenFader.fadeOut(VICTIM_FADE_SECONDS, 3)
+				end
+			end)
 		else
-			EliminationOverlay.showOther(State.nameOf(event.userId), event.reason, event.answer)
+			EliminationOverlay.showOther(State.tagName(event.userId), event.reason, event.answer)
 		end
 	elseif kind == "Accepted" then
-		local who = if event.userId == State.localUserId then "YOUR ANSWER" else string.upper(State.nameOf(event.userId))
+		local who = if event.userId == State.localUserId then "YOUR ANSWER" else State.tagName(event.userId)
 		Toasts.show(`{who} ACCEPTED: "{event.answer or ""}"`, "Good")
 	elseif kind == "JudgeTimeout" then
 		Toasts.show(event.text or "THE CALLER RAN OUT OF TIME - ANSWER ACCEPTED", "Warn")
@@ -374,6 +435,17 @@ end
 ----------------------------------------------------------------------------
 -- Queue mirror
 ----------------------------------------------------------------------------
+-- The local player's elevator starts its ride: rumble, flicker, floor
+-- indicator, fade to black, and the lobby music bows out.
+local function checkDeparture()
+	local index = State.queueIndex
+	local status = if index then State.queues[index] else nil
+	if index and status and status.state == "Departing" and State.snapshot == nil then
+		DepartureFX.start(index)
+		LobbyMusic.setLobby(false)
+	end
+end
+
 local function onQueueStatus(list: { Remotes.QueueStatus })
 	if type(list) ~= "table" then
 		return
@@ -384,12 +456,14 @@ local function onQueueStatus(list: { Remotes.QueueStatus })
 			State.queues[status.index] = status
 		end
 	end
-	QueueHUD.update()
+	checkDeparture()
+	PartyMenu.update()
 end
 
 local function onQueueMembership(index: number?)
 	State.queueIndex = if type(index) == "number" then index else nil
-	QueueHUD.update()
+	checkDeparture()
+	PartyMenu.update()
 end
 
 local function onInputRejected(what: string, reason: string)
@@ -412,10 +486,11 @@ end
 ----------------------------------------------------------------------------
 -- Frame loop: ticks only the visible widgets; nothing rebuilds here.
 ----------------------------------------------------------------------------
-local function onRenderStep()
+local function onRenderStep(dt: number)
 	local beat = MusicController.currentBeat()
-	QueueHUD.step()
-	IntroOverlay.step()
+	TextFX.step()
+	PartyMenu.step(dt)
+	IntroOverlay.step(dt)
 	InfoCard.step()
 	CategoryPanel.step()
 	GameHUD.step()
@@ -431,6 +506,10 @@ local function onRenderStep()
 	if snapshot and spectatorCameraAfter > 0 and os.clock() >= spectatorCameraAfter then
 		spectatorCameraAfter = 0
 		routeCamera(snapshot)
+		if victimFading then
+			victimFading = false
+			ScreenFader.fadeIn(0.5)
+		end
 	end
 end
 

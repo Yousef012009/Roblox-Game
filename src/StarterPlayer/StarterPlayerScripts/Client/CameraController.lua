@@ -7,7 +7,8 @@
 	  Intro        IntroCamera → InterrogationCamera dolly (Config.Camera.IntroDollySeconds)
 	  Room         InterrogationCamera (Caller while judging: CallerCamera), subtle sway
 	  Spectator    one of Names.SpectatorCameras (cycle with cycleSpectator)
-	  Victory      VictoryCamera
+	  Victory      VictoryCamera, slowly orbiting (a gentle arc) and dollying in
+	               toward the winner's seat (setVictoryFocus) or the table
 
 	Every pose comes from the named anchor Parts of the player's own room
 	(the anchor's CFrame is the camera pose). Sway is disabled while a local
@@ -31,6 +32,11 @@ local BIND_NAME = "C64Camera"
 local LOBBY_FOV = 70
 local REFERENCE_ASPECT = 16 / 9
 local JOLT_SECONDS = 0.45
+local VICTORY_ARC = math.rad(10) -- orbit swing either side of the anchor
+local VICTORY_ARC_SPEED = 0.22 -- rad/s of the swing phase
+local VICTORY_DOLLY = 0.2 -- fraction of the distance closed by the dolly
+local VICTORY_DOLLY_SECONDS = 8
+local VICTORY_FOCUS_DISTANCE = 14 -- fallback focus: this far along the anchor's look
 
 local mode: Mode = "Lobby"
 local room: Model? = nil
@@ -40,6 +46,8 @@ local bound = false
 
 local currentCFrame: CFrame? = nil
 local introStartedAt = 0
+local victoryStartedAt = 0
+local victoryFocus: Vector3? = nil
 local spectatorIndex = 1
 local joltUntil = 0
 local swayClock = 0
@@ -129,7 +137,18 @@ local function targetCFrame(now: number): CFrame?
 		spectatorIndex = ((spectatorIndex - 1) % #list) + 1
 		return anchorCFrame(list[spectatorIndex])
 	elseif mode == "Victory" then
-		return anchorCFrame(Names.VictoryCamera) or anchorCFrame(Names.InterrogationCamera)
+		local base = anchorCFrame(Names.VictoryCamera) or anchorCFrame(Names.InterrogationCamera)
+		if not base then
+			return nil
+		end
+		local focus = victoryFocus or (base.Position + base.LookVector * VICTORY_FOCUS_DISTANCE)
+		local t = now - victoryStartedAt
+		local angle = VICTORY_ARC * math.sin(t * VICTORY_ARC_SPEED)
+		local d = math.clamp(t / VICTORY_DOLLY_SECONDS, 0, 1)
+		local dolly = 1 - VICTORY_DOLLY * d * d * (3 - 2 * d)
+		local offset = (base.Position - focus) * dolly
+		local position = focus + CFrame.Angles(0, angle, 0):VectorToWorldSpace(offset)
+		return CFrame.lookAt(position, focus)
 	end
 	return nil
 end
@@ -214,6 +233,8 @@ function CameraController.setMode(newMode: Mode)
 	end
 	if newMode == "Intro" then
 		introStartedAt = os.clock()
+	elseif newMode == "Victory" then
+		victoryStartedAt = os.clock()
 	end
 	if previous == "Lobby" then
 		currentCFrame = nil -- cut, don't blend from the lobby
@@ -226,6 +247,11 @@ end
 
 function CameraController.getMode(): Mode
 	return mode
+end
+
+-- World point the victory shot orbits / dollies toward (nil = the anchor's view).
+function CameraController.setVictoryFocus(point: Vector3?)
+	victoryFocus = point
 end
 
 function CameraController.setCallerFocus(on: boolean)

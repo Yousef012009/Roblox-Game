@@ -2,15 +2,18 @@
 --[[
 	CharacterUtil  (ModuleScript)  ·  ServerScriptService/Server/CharacterUtil
 
-	Small, nil-safe character helpers shared by QueueService and Match.
-	Every function tolerates a missing character / humanoid / root part and
-	simply does nothing (returning false where a result is useful), because
-	characters can vanish at any moment (death, respawn, disconnect).
+	Small, nil-safe character helpers shared by QueueService, Match and
+	BotRig. Every function tolerates a missing character / humanoid / root
+	part and simply does nothing (returning false where a result is useful),
+	because characters can vanish at any moment (death, respawn, disconnect).
 
 	    CharacterUtil.seat(player, seat)        PivotTo above the seat, then Seat:Sit
 	    CharacterUtil.teleport(player, cframe)  unseat, then PivotTo cframe + 3 studs up
 	    CharacterUtil.lockMovement(player)      WalkSpeed / JumpPower / JumpHeight = 0
 	    CharacterUtil.unlockMovement(player)    restore the StarterPlayer defaults
+
+	The *Character variants take any humanoid model (AI detectives have no
+	Player): seatCharacter(model, humanoid, seat), teleportCharacter(model, cframe).
 ]]
 
 local StarterPlayer = game:GetService("StarterPlayer")
@@ -82,11 +85,10 @@ function CharacterUtil.unseat(player: Player)
 	end
 end
 
--- Moves the character to `cframe` (3 studs higher). Unseats first: a seated
--- character is welded to its seat and PivotTo would drag the seat along.
-function CharacterUtil.teleport(player: Player, cframe: CFrame): boolean
-	local character = player.Character
-	if not character or not character.Parent then
+-- Moves any humanoid model to `cframe` (3 studs higher). Unseats first: a
+-- seated character is welded to its seat and PivotTo would drag the seat along.
+function CharacterUtil.teleportCharacter(character: Model, cframe: CFrame): boolean
+	if not character.Parent then
 		return false
 	end
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
@@ -97,13 +99,19 @@ function CharacterUtil.teleport(player: Player, cframe: CFrame): boolean
 	return true
 end
 
--- Sits the player in `seat`. Anyone else occupying it is ejected first (match
--- seats belong to exactly one player). Returns false if the player has no
--- living character.
-function CharacterUtil.seat(player: Player, seat: Seat): boolean
+function CharacterUtil.teleport(player: Player, cframe: CFrame): boolean
 	local character = player.Character
-	local humanoid = CharacterUtil.getHumanoid(player)
-	if not character or not character.Parent or not humanoid or humanoid.Health <= 0 then
+	if not character then
+		return false
+	end
+	return CharacterUtil.teleportCharacter(character, cframe)
+end
+
+-- Sits `humanoid` (inside `character`) in `seat`. Anyone else occupying it is
+-- ejected first (match seats belong to exactly one participant). Returns
+-- false if the character is not in the world or the humanoid is dead.
+function CharacterUtil.seatCharacter(character: Model, humanoid: Humanoid, seat: Seat): boolean
+	if not character.Parent or humanoid.Parent ~= character or humanoid.Health <= 0 then
 		return false
 	end
 	if seat.Occupant == humanoid then
@@ -118,6 +126,16 @@ function CharacterUtil.seat(player: Player, seat: Seat): boolean
 	character:PivotTo(seat.CFrame + Vector3.new(0, SEAT_DROP_HEIGHT, 0))
 	seat:Sit(humanoid)
 	return true
+end
+
+-- Sits the player in `seat` (see seatCharacter).
+function CharacterUtil.seat(player: Player, seat: Seat): boolean
+	local character = player.Character
+	local humanoid = CharacterUtil.getHumanoid(player)
+	if not character or not humanoid then
+		return false
+	end
+	return CharacterUtil.seatCharacter(character, humanoid, seat)
 end
 
 function CharacterUtil.lockMovement(player: Player)

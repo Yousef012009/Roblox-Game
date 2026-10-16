@@ -11,6 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Remotes = require(ReplicatedStorage.Shared.Remotes)
 local State = require(script.Parent.State)
+local TextFX = require(script.Parent.TextFX)
 local UIKit = require(script.Parent.UIKit)
 
 local JudgePanel = {}
@@ -44,7 +45,7 @@ function JudgePanel.mount(parent: Instance)
 	root = UIKit.panel({
 		Name = "JudgePanel",
 		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 122),
+		Position = UDim2.new(0.5, 0, 0, UIKit.Layout.BelowHud),
 		Size = UDim2.new(0.94, 0, 0, 196),
 		Visible = false,
 		ZIndex = 20,
@@ -129,8 +130,8 @@ function JudgePanel.update()
 		UIKit.setText(headerLabel, if locked then "VERDICT SENT" else "JUDGE THE ANSWER")
 	end
 	local category = if snapshot.category then string.upper(snapshot.category) else "?"
-	UIKit.setText(whoLabel, `{string.upper(State.nameOf(judging.userId))} SAID  ·  {category}`)
-	UIKit.setText(answerLabel, `"{judging.answer}"`)
+	UIKit.setText(whoLabel, `{State.tagName(judging.userId)} SAID  ·  {category}`)
+	TextFX.typeIfChanged(answerLabel, `"{judging.answer}"`, { cps = 36, glitch = true })
 end
 
 function JudgePanel.setVisible(on: boolean)
@@ -161,6 +162,9 @@ function JudgePanel.step()
 		lastSeconds = seconds
 		timerLabel.Text = UIKit.clock(seconds)
 		timerLabel.TextColor3 = if seconds <= 3 then UIKit.Colors.Red else UIKit.Colors.Text
+		if seconds <= 2 and seconds > 0 then
+			UIKit.pulse(timerLabel, 1.4, 0.35)
+		end
 	end
 end
 

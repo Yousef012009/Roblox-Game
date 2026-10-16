@@ -45,7 +45,7 @@ ServerScriptService
 ├── MapGenerator          (Script)       builds the map (idempotent)
 ├── MapGen/               (ModuleScripts) Palette · Builder · Props · Environment · Lobby · QueueElevator · InterrogationModule
 ├── GameManager           (Script)       waits for MapReady, boots services
-└── Server/               (ModuleScripts) QueueService · MatchService · Match · RoomController · CharacterUtil · TextFilter · RateLimiter
+└── Server/               (ModuleScripts) QueueService · MatchService · Match · RoomController · CharacterUtil · TextFilter · RateLimiter · BotRig · BotBrain · WordBank
 StarterPlayer.StarterPlayerScripts
 ├── ClientManager         (LocalScript)
 └── Client/               (ModuleScripts) UIKit · Screens… · MusicController · RoomFX · LobbyFX · CameraController
@@ -57,13 +57,13 @@ The **naming contract** for every gameplay-critical object is `ReplicatedStorage
 
 * All floors have their **top surface at Y = 0.2**, so they never z-fight the Baseplate at Y = 0.
 * **Lobby**: footprint X ∈ [-70, 70], Z ∈ [-60, 60], ceiling about 34. Spawn area at the front (Z ≈ +40). Back wall at Z = -60.
-* **Queue elevators**: four chambers recessed behind the back wall, centred at X = -45, -15, 15, 45, interior about 11 × 11 × 12. Door opening faces +Z into the lobby. `QueueNN_Trigger` covers the interior floor area (height about 8). `QueueNN_Exit` sits about 6 studs in front of the door, inside the lobby. `QueueNN_Spot1..4` are the four standing marks.
+* **Queue elevators**: four chambers recessed behind the back wall, centred at X = -45, -15, 15, 45, interior about 11 × 11 × 12. Door opening faces +Z into the lobby. `QueueNN_Trigger` covers the interior floor area (height about 8). `QueueNN_Exit` sits about 6 studs in front of the door, inside the lobby. `QueueNN_Spot1..8` are the standing marks (up to 8 players).
 * **Interrogation module** (template pivot = module origin). Slot 0 is placed at `Config.Match.RoomOrigin` = (100, 0, 0). Slot *k* is offset along Z by `RoomSpacing` (320), alternating + and −.
   * Interrogation room interior: X ∈ [-14, 14], Z ∈ [-12, 12], height 14.
   * Two-way mirror in the wall at X = +14.5: opening Z ∈ [-9, 9], Y ∈ [3, 11].
   * Spectator lounge interior: X ∈ [15, 29], Z ∈ [-12, 12] (behind the mirror).
   * TV on the X = -14 wall, Front face toward +X, centre about Y = 8.
-  * Table at the room centre. **SeatAnchor01** north (Z ≈ -5.5, facing +Z), **02** east (X ≈ +7, facing -X), **03** south (Z ≈ +5.5, facing -Z), **04** west (X ≈ -7, facing +X). That is clockwise from above, so "to my left" is the next seat number.
+  * Long table at the room centre with **8 seats** (SeatAnchor01..08) all facing the table, numbered **clockwise from above** so "to my left" is the next seat number: 01–03 along the north side (Z ≈ -5, west→east), 04 at the east end, 05–07 along the south side (east→west), 08 at the west end. Matches with fewer participants are spread evenly clockwise (4 of 8 → seats 1, 3, 5, 7).
   * BulbPivot at the ceiling above the table (Y ≈ 13.6). The bulb hangs about 5 studs below it.
   * InterrogationCamera: high, on the mirror side, looking at the table and TV. SpectatorCamera: in the lounge, looking through the mirror at the same subject.
   * Module total X span [-15, 30] → world X 85…130. It never overlaps the lobby (X ≤ 70).
@@ -71,7 +71,7 @@ The **naming contract** for every gameplay-critical object is `ReplicatedStorage
 ## 4. Match state machine
 
 ```
-QUEUEING (QueueService) ──4 players + free slot──► INTRO
+QUEUEING (QueueService) ──host's party ready (humans inside, or START NOW) + free slot──► INTRO (bots fill the chosen extra seats)
 INTRO ──IntroSeconds──► CALLER_SELECTION ──CallerRevealSeconds──► CATEGORY_SELECTION
 CATEGORY_SELECTION ──Caller submits (or timeout → fallback)──► COUNTDOWN
 COUNTDOWN (music starts; chant 16 beats; sting reveals category) ──beat 20──► PLAYING

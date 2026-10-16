@@ -150,6 +150,19 @@ function RoomController.getSeatCount(self: RoomController): number
 	return self.seatCount
 end
 
+-- Seat numbers for `count` participants, spread as evenly as possible over
+-- the room's seats in clockwise order (4 of 8 -> 1, 3, 5, 7; 3 of 8 -> 1,
+-- 3, 6). More participants than seats: 1..count (the extra numbers have no
+-- Seat and Match falls back to standing them near the table).
+function RoomController.spreadSeats(self: RoomController, count: number): { number }
+	local seats = self.seatCount
+	local numbers: { number } = table.create(count)
+	for index = 1, count do
+		numbers[index] = if count <= seats then (index - 1) * seats // count + 1 else index
+	end
+	return numbers
+end
+
 -- Seat number of a Seat instance belonging to this room, or nil.
 function RoomController.seatNumberOf(self: RoomController, seat: Seat): number?
 	for number, candidate in self.seats do

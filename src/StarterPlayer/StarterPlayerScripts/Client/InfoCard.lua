@@ -10,6 +10,7 @@
 ]]
 
 local State = require(script.Parent.State)
+local TextFX = require(script.Parent.TextFX)
 local UIKit = require(script.Parent.UIKit)
 
 local InfoCard = {}
@@ -27,7 +28,7 @@ function InfoCard.mount(parent: Instance)
 	root = UIKit.panel({
 		Name = "InfoCard",
 		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 126),
+		Position = UDim2.new(0.5, 0, 0, UIKit.Layout.BelowHud + 4),
 		Size = UDim2.new(0.9, 0, 0, 96),
 		Visible = false,
 		ZIndex = 10,
@@ -65,8 +66,13 @@ function InfoCard.mount(parent: Instance)
 end
 
 function InfoCard.show(title: string, body: string?, endsAt: number?, accent: Color3?)
-	UIKit.setText(titleLabel, title)
-	UIKit.setText(bodyLabel, body or "")
+	if titleLabel.Text ~= title then
+		titleLabel.Text = title
+		if visible then
+			UIKit.pulse(titleLabel, 1.1, 0.3)
+		end
+	end
+	TextFX.typeIfChanged(bodyLabel, body or "", { cps = 55 })
 	accentBar.BackgroundColor3 = accent or UIKit.Colors.Phosphor
 	titleLabel.TextColor3 = accent or UIKit.Colors.Text
 	if deadline ~= endsAt then
@@ -95,6 +101,10 @@ function InfoCard.step()
 	if seconds ~= lastSeconds then
 		lastSeconds = seconds
 		timerLabel.Text = UIKit.clock(seconds)
+		timerLabel.TextColor3 = if seconds <= 2 then UIKit.Colors.Red else UIKit.Colors.Phosphor
+		if seconds <= 2 and seconds > 0 then
+			UIKit.pulse(timerLabel, 1.3, 0.35)
+		end
 	end
 end
 

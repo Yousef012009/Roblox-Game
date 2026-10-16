@@ -4,6 +4,8 @@
 
 	Small stacked notices under the HUD (Notify, Notice, JudgeTimeout,
 	InputRejected...). A fixed pool of slots is built once and recycled.
+	Each toast slides in from the side with a slight overshoot (the slot is
+	a layout cell; its inner panel is what moves).
 ]]
 
 local UIKit = require(script.Parent.UIKit)
@@ -15,9 +17,9 @@ local Toasts = {}
 local SLOT_COUNT = 3
 local LIFETIME = 3.4
 local SLOT_HEIGHT = 30
-local TOP_OFFSET = 122 -- below the game HUD + metronome
+local TOP_OFFSET = UIKit.Layout.BelowHud -- below the game HUD + metronome
 
-type Slot = { frame: Frame, label: TextLabel, bar: Frame, expiresAt: number, serial: number }
+type Slot = { frame: Frame, inner: Frame, label: TextLabel, bar: Frame, expiresAt: number, serial: number }
 
 local slots: { Slot } = {}
 local serial = 0
@@ -48,28 +50,36 @@ function Toasts.mount(parent: Instance)
 		}),
 	})
 	for i = 1, SLOT_COUNT do
-		local frame = UIKit.panel({
+		local frame = UIKit.new("Frame", {
 			Name = `Toast{i}`,
+			BackgroundTransparency = 1,
 			Size = UDim2.new(1, 0, 0, SLOT_HEIGHT),
 			Visible = false,
 			ZIndex = 40,
 			Parent = holder,
+		})
+		local inner = UIKit.panel({
+			Name = "Inner",
+			Size = UDim2.fromScale(1, 1),
+			Visible = false,
+			ZIndex = 40,
+			Parent = frame,
 		})
 		local bar = UIKit.new("Frame", {
 			BorderSizePixel = 0,
 			BackgroundColor3 = UIKit.Colors.Text,
 			Size = UDim2.new(0, 3, 1, 0),
 			ZIndex = 41,
-			Parent = frame,
+			Parent = inner,
 		})
 		local label = UIKit.label({
 			Position = UDim2.fromOffset(10, 0),
 			Size = UDim2.new(1, -16, 1, 0),
 			TextXAlignment = Enum.TextXAlignment.Left,
 			ZIndex = 41,
-			Parent = frame,
+			Parent = inner,
 		}, 16, 9)
-		table.insert(slots, { frame = frame, label = label, bar = bar, expiresAt = 0, serial = 0 })
+		table.insert(slots, { frame = frame, inner = inner, label = label, bar = bar, expiresAt = 0, serial = 0 })
 	end
 end
 
@@ -97,8 +107,9 @@ function Toasts.show(text: string, kind: Kind?)
 	chosen.label.Text = string.upper(text)
 	chosen.label.TextColor3 = color
 	chosen.bar.BackgroundColor3 = color
-	chosen.frame.Visible = false
-	UIKit.reveal(chosen.frame, -6)
+	chosen.frame.Visible = true
+	chosen.inner.Visible = false
+	UIKit.reveal(chosen.inner, 0, 36)
 end
 
 function Toasts.step()

@@ -30,6 +30,7 @@ local startTime: number? = nil
 local generation = 0 -- bumps on every start/stop so stale scheduled threads quit
 local resyncAccumulator = 0
 local heartbeat: RBXScriptConnection? = nil
+local muted = false
 
 local function getSound(): Sound?
 	if Config.Music.SoundId == "" then
@@ -39,7 +40,7 @@ local function getSound(): Sound?
 		local s = Instance.new("Sound")
 		s.Name = "Concentration64Music"
 		s.SoundId = Config.Music.SoundId
-		s.Volume = Config.Music.Volume
+		s.Volume = if muted then 0 else Config.Music.Volume
 		s.Looped = true
 		s.PlaybackRegionsEnabled = true
 		s.LoopRegion = NumberRange.new(MusicTimeline.LoopStart, MusicTimeline.LoopEnd)
@@ -147,6 +148,16 @@ function MusicController.stop()
 	end
 	if sound then
 		sound:Stop()
+	end
+end
+
+-- Local mute (the ♪ toggle). The song keeps running silently so it stays on
+-- the shared timeline and un-muting is instant.
+function MusicController.setMuted(on: boolean)
+	muted = on
+	local s = sound
+	if s then
+		s.Volume = if on then 0 else Config.Music.Volume
 	end
 end
 

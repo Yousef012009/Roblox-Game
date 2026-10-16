@@ -10,10 +10,13 @@
 	  • QueueService reserves a slot when a queue starts departing
 	    (reserveSlot) and hands the reservation to startMatch, so two queues
 	    departing in the same scan can never race for the last room.
-	  • startMatch clones ServerStorage.InterrogationModuleTemplate, names it
-	    Match_<slot>, tags it (MatchId, Slot), pivots it into place BEFORE
-	    parenting it to Workspace.ActiveMatches, makes it PersistentPerPlayer
-	    for its participants and starts a Match.
+	  • startMatch(humans, botCount, ...) clones ServerStorage.
+	    InterrogationModuleTemplate, names it Match_<slot>, tags it (MatchId,
+	    Slot), pivots it into place BEFORE parenting it to
+	    Workspace.ActiveMatches, makes it PersistentPerPlayer for its humans
+	    and starts a Match with `botCount` AI detectives (negative userIds,
+	    unique for the server's lifetime; Config.Bots.Enabled = false or a
+	    full room means fewer / none).
 	  • Remote input is type-checked here, then routed to the sender's match
 	    only if the matchId the client echoed is that match's id.
 ]]
@@ -39,6 +42,7 @@ type MatchServiceData = {
 	slots: { [number]: Match.Match },
 	reserved: { [number]: boolean },
 	playerMatch: { [Player]: Match.Match },
+	nextBotId: number, -- counts down: -1, -2, ...
 	rng: Random,
 	warnedNoLobby: boolean,
 }
@@ -92,6 +96,7 @@ function MatchService.new(map: Instance, activeFolder: Instance): MatchService
 		slots = {},
 		reserved = {},
 		playerMatch = {},
+		nextBotId = 0,
 		rng = Random.new(),
 		warnedNoLobby = false,
 	}
@@ -278,12 +283,14 @@ local function cloneRoom(self: MatchService, slot: number, matchId: string, rost
 	return room
 end
 
--- Starts a match for `players` (seat order = list order). `reservedSlot`
--- (from reserveSlot) is consumed whatever happens. Never yields. Returns
--- nil if no slot / template / eligible player is available.
+-- Starts a match for `humans` plus `botCount` AI detectives (the Match
+-- shuffles them around the table). `reservedSlot` (from reserveSlot) is
+-- consumed whatever happens. Never yields. Returns nil if no slot /
+-- template / eligible human is available.
 function MatchService.startMatch(
 	self: MatchService,
-	players: { Player },
+	humans: { Player },
+	botCount: number,
 	queueIndex: number,
 	reservedSlot: number?
 ): Match.Match?
@@ -296,14 +303,28 @@ function MatchService.startMatch(
 		return nil
 	end
 
+	local capacity = Config.Queue.Capacity
 	local roster: { Player } = {}
-	for _, player in players do
-		if player.Parent == Players and not self.playerMatch[player] and not table.find(roster, player) then
+	for _, player in humans do
+		if
+			#roster < capacity
+			and player.Parent == Players
+			and not self.playerMatch[player]
+			and not table.find(roster, player)
+		then
 			table.insert(roster, player)
 		end
 	end
 	if #roster == 0 then
 		return nil
+	end
+
+	local wantedBots = if Config.Bots.Enabled and botCount == botCount then math.floor(botCount) else 0
+	local bots = math.clamp(wantedBots, 0, capacity - #roster)
+	local botIds: { number } = table.create(bots)
+	for index = 1, bots do
+		self.nextBotId -= 1
+		botIds[index] = self.nextBotId
 	end
 
 	local matchId = HttpService:GenerateGUID(false)
@@ -319,6 +340,7 @@ function MatchService.startMatch(
 		queueIndex = queueIndex,
 		room = room,
 		players = roster,
+		botIds = botIds,
 		releasePlayer = function(player: Player)
 			self:releasePlayer(player, match)
 		end,
@@ -334,7 +356,7 @@ function MatchService.startMatch(
 		self.playerMatch[player] = match
 	end
 	if Config.Debug.Verbose then
-		print(`[MatchService] match {matchId} in {room.Name} from queue {queueIndex} with {#roster} players`)
+		print(`[MatchService] match {matchId} in {room.Name} from queue {queueIndex}: {#roster} humans + {bots} bots`)
 	end
 	match:start()
 	return match

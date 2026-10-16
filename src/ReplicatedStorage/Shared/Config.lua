@@ -7,7 +7,7 @@
 
 	Most-edited values:
 	  • Music.SoundId            upload your track, paste "rbxassetid://<id>"
-	  • Queue.MinPlayersToStart  4 for real play; Studio tests use StudioMinPlayersToStart
+	  • Queue.DefaultHumans/Bots default party; hosts change it in the elevator menu
 	  • Match.RoundsPerMatch     0 = one round per player (everyone is Caller once)
 	  • Turn.BeatsPerTurn        answer window, in beats of the song
 ]]
@@ -19,10 +19,15 @@ local Config = {}
 ----------------------------------------------------------------------------
 Config.Queue = {
 	Count = 4, -- Queue01..Queue04 (the map generator builds this many)
-	Capacity = 4, -- players per chamber / per match
-	MinPlayersToStart = 4, -- live servers: start only when the chamber is full
-	StudioMinPlayersToStart = 3, -- Studio: 3 is the smallest playable match (1 Caller + 2 answerers)
-	PartialStartDelaySeconds = 12, -- below Capacity but at/over the minimum: wait this long for more
+	Capacity = 8, -- max participants (humans + bots) per chamber / per match; the room has this many seats
+	MinParticipants = 3, -- smallest playable match: 1 Caller + 2 answerers (bots count)
+	-- PARTY SETUP (the elevator menu). The first player in a chamber is its
+	-- HOST and picks how many HUMANS to wait for and how many BOTS to add
+	-- (humans + bots <= Capacity). The doors close once that many humans are
+	-- inside; "START NOW" leaves immediately with whoever is there (bots are
+	-- topped up so the match has at least MinParticipants).
+	DefaultHumans = 4,
+	DefaultBots = 0,
 	StartCountdownSeconds = 4, -- "doors closing" countdown once a start is possible
 	DepartSeconds = 1.5, -- doors shut, elevator "moves", then players arrive in the room
 	ScanInterval = 0.2, -- server spatial check rate (seconds)
@@ -30,11 +35,38 @@ Config.Queue = {
 }
 
 ----------------------------------------------------------------------------
+-- AI detectives (bots). They fill seats so you can play solo or with friends.
+----------------------------------------------------------------------------
+Config.Bots = {
+	Enabled = true,
+	Names = { "Det. Morse", "Det. Marlowe", "Det. Spade", "Det. Columbo", "Det. Poirot", "Det. Vance", "Det. Hale", "Det. Rook" },
+	AnswerDelay = { 1.2, 3.6 }, -- seconds after their turn opens (clamped inside the turn window)
+	HesitateChance = 0.07, -- freezes up and runs out of time
+	RepeatChance = 0.05, -- blurts out an answer that was already accepted
+	WrongChance = 0.06, -- says something off-category (the Caller should reject it)
+	JudgeDelay = { 1.4, 3.0 }, -- a bot Caller "thinks" this long before ruling
+	JudgeAcceptUnknownChance = 0.65, -- a bot Caller accepts answers it doesn't know this often
+	CategoryDelay = { 2.0, 4.0 }, -- a bot Caller takes this long to pick a category
+}
+
+----------------------------------------------------------------------------
+-- Animations: Roblox's own default avatar animations (the ones the built-in
+-- Animate script uses), so they work in any game. Empty string = off.
+----------------------------------------------------------------------------
+Config.Animations = {
+	Sit = "rbxassetid://2506281703",
+	Cheer = "rbxassetid://507770677",
+	Point = "rbxassetid://507770453",
+	Wave = "rbxassetid://507770239",
+	Laugh = "rbxassetid://507770818",
+}
+
+----------------------------------------------------------------------------
 -- Matches
 ----------------------------------------------------------------------------
 Config.Match = {
-	MinPlayersToContinue = 3, -- Caller + 2 answerers; below this the match ends
-	RoundsPerMatch = 0, -- 0 = one round per starting player, so everyone is Caller once. 1 = single round.
+	MinPlayersToContinue = 3, -- Caller + 2 answerers (bots count); below this the match ends
+	RoundsPerMatch = 0, -- 0 = one round per HUMAN (each human is Caller once; solo = 1 round with a bot Caller). 1 = single round.
 	MaxConcurrentMatches = 8, -- room slots; queues wait if all are busy
 	RoomOrigin = Vector3.new(100, 0, 0), -- slot 0 (the first room) is placed here
 	RoomSpacing = 320, -- studs between slots along Z (slot 1 at +Z, slot 2 at -Z, ...)
@@ -99,6 +131,9 @@ Config.Text = {
 ----------------------------------------------------------------------------
 Config.Music = {
 	SoundId = "", -- ← paste "rbxassetid://<your uploaded id>". Empty = silent mode (visuals still run on the timeline)
+	LobbySoundId = "", -- ← lobby/elevator background music (upload assets/LobbyNoir.mp3). Empty = off
+	LobbyVolume = 0.35,
+	LobbyFadeSeconds = 1.5, -- cross-fade between lobby music and match music
 	Volume = 0.6,
 	BPM = 90,
 	BeatsPerMeasure = 4,

@@ -56,7 +56,7 @@ Handy tips:
 | ELIMINATED overlay | `Client › EliminationOverlay` | |
 | Spectator bar | `Client › SpectatorHUD` | |
 | Winner screen | `Client › VictoryScreen` | |
-| Queue popup in the elevator | `Client › QueueHUD` | |
+| Queue popup in the elevator (party menu: players / bots, START NOW, LEAVE) | `Client › PartyMenu` | |
 | Signs in the map | the baked parts themselves (select a sign → its `SurfaceGui › TextLabel` → `Text`) | |
 
 Only change text inside quotes `"…"`. If a line has `{something}` inside backticks, keep the `{…}` part: that's where a name or number gets inserted.

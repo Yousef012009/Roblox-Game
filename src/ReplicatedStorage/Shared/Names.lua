@@ -19,7 +19,7 @@
 	│       └── Queue01 … Queue04             (Model)    attributes: QueueIndex, DoorsOpen, Count, State
 	│           ├── Queue01_Trigger           (Part)     invisible detection volume (server spatial check)
 	│           ├── Queue01_Exit              (Part)     where players are placed when removed from the queue
-	│           ├── Queue01_Spot1 … _Spot4    (Part)     floor markings / arrival points
+	│           ├── Queue01_Spot1 … _Spot8    (Part)     floor markings / arrival points
 	│           ├── Queue01_Display           (Part)     SurfaceGui "DisplayGui" > TextLabel "Count" ("2/4")
 	│           ├── Queue01_LightRed          (Part)     neon status light
 	│           ├── Queue01_LightGreen        (Part)
@@ -30,14 +30,14 @@
 	ServerStorage
 	└── InterrogationModuleTemplate           (Model)    PrimaryPart = ModuleRoot, pivot at the module origin
 	    ├── ModuleRoot                        (Part)     invisible; Model pivot = room centre on the floor
-	    ├── Seats                             (Folder)   SeatAnchor01 … SeatAnchor04 (Seat), clockwise from above
+	    ├── Seats                             (Folder)   SeatAnchor01 … SeatAnchor08 (Seat), clockwise from above
 	    ├── TVScreen                          (Part)     Front face → room; SurfaceGui "TVGui"
 	    │       TVGui > Screen (Frame) > Header, Category, Speaker, Answer, Footer (TextLabels), Static (Frame)
 	    ├── BulbPivot                         (Part)     invisible, at the ceiling; the swing hinge
 	    ├── BulbAssembly                      (Model)    PrimaryPart "Bulb"; Cable, Socket, Bulb (PointLight "BulbLight")
 	    ├── TwoWayMirror                      (Part)     restyled locally per client
 	    ├── RoomLights                        (Folder)   lights the client tints red on elimination
-	    ├── SpectatorSpawns                   (Folder)   SpectatorSpawn01 … SpectatorSpawn04 (Part)
+	    ├── SpectatorSpawns                   (Folder)   SpectatorSpawn01 … SpectatorSpawn08 (Part)
 	    ├── CameraAnchors                     (Folder)   IntroCamera, InterrogationCamera, CallerCamera,
 	    │                                                SpectatorCamera, SpectatorCamera02, SpectatorCamera03, VictoryCamera
 	    └── RoomDoor                          (Part)     heavy metal door (decor + entry point)

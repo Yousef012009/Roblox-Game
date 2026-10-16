@@ -13,13 +13,18 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local MusicTimeline = require(ReplicatedStorage.Shared.MusicTimeline)
+local Config = require(ReplicatedStorage.Shared.Config)
 local MusicController = require(script.Parent.MusicController)
 local State = require(script.Parent.State)
+local TextFX = require(script.Parent.TextFX)
 local UIKit = require(script.Parent.UIKit)
 
 local GameHUD = {}
 
-local MAX_CHIPS = 5 -- 3 answerers + Caller at capacity 4, one spare
+local MAX_CHIPS = Config.Queue.Capacity + 1 -- every answerer + the Caller chip, one spare
+local MAX_NAME_ONE_ROW = 14 -- characters per chip name before "…"
+local MAX_NAME_TWO_ROWS = 9
+local AI_TAG = ` <font color="#d2a85c" size="10">AI</font>`
 
 local root: Frame
 local roundLabel: TextLabel
@@ -27,29 +32,35 @@ local categoryLabel: TextLabel
 local timerLabel: TextLabel
 local nowLabel: TextLabel
 local chips: { TextLabel } = {}
+local grid: UIGridLayout
+local chipRows = 0
+local chipsPerRow = 0
 local beatFill: Frame
 local visible = false
 local lastSeconds = -1
 local lastFill = -1
 
-local function escape(text: string): string
-	local escaped = string.gsub(text, "&", "&amp;")
-	escaped = string.gsub(escaped, "<", "&lt;")
-	escaped = string.gsub(escaped, ">", "&gt;")
-	return escaped
+local function shorten(text: string, maxChars: number): string
+	local length = utf8.len(text)
+	if length == nil or length <= maxChars then
+		return text
+	end
+	local cut = utf8.offset(text, maxChars) or (#text + 1)
+	return string.sub(text, 1, cut - 1) .. "…"
 end
 
 function GameHUD.mount(parent: Instance)
+	local height = UIKit.Layout.HudHeight
 	root = UIKit.panel({
 		Name = "GameHUD",
 		AnchorPoint = Vector2.new(0.5, 0),
-		Position = UDim2.new(0.5, 0, 0, 4),
-		Size = UDim2.new(0.97, 0, 0, 86),
+		Position = UDim2.new(0.5, 0, 0, UIKit.Layout.HudTop),
+		Size = UDim2.new(0.97, 0, 0, height),
 		Visible = false,
 		ZIndex = 5,
 		Parent = parent,
 	})
-	UIKit.sizeLimit(Vector2.new(0, 0), Vector2.new(900, 86)).Parent = root
+	UIKit.sizeLimit(Vector2.new(0, 0), Vector2.new(900, height)).Parent = root
 
 	roundLabel = UIKit.label({
 		TextColor3 = UIKit.Colors.TextDim,
@@ -84,18 +95,21 @@ function GameHUD.mount(parent: Instance)
 	}, 16)
 
 	local strip = UIKit.new("Frame", {
+		Name = "TurnStrip",
 		BackgroundTransparency = 1,
 		Position = UDim2.fromOffset(6, 53),
-		Size = UDim2.new(1, -12, 0, 24),
+		Size = UDim2.new(1, -12, 0, 38),
 		ZIndex = 6,
 		Parent = root,
-	}, {
-		UIKit.new("UIListLayout", {
-			FillDirection = Enum.FillDirection.Horizontal,
-			HorizontalAlignment = Enum.HorizontalAlignment.Center,
-			SortOrder = Enum.SortOrder.LayoutOrder,
-			Padding = UDim.new(0, 4),
-		}),
+	})
+	grid = UIKit.new("UIGridLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		CellPadding = UDim2.fromOffset(4, 2),
+		CellSize = UDim2.new(0.25, -4, 0, 24),
+		Parent = strip,
 	})
 	for i = 1, MAX_CHIPS do
 		local chip = UIKit.label({
@@ -104,11 +118,10 @@ function GameHUD.mount(parent: Instance)
 			LayoutOrder = i,
 			BackgroundColor3 = UIKit.Colors.PanelLight,
 			BackgroundTransparency = 0.3,
-			Size = UDim2.new(1 / MAX_CHIPS, -4, 1, 0),
 			Visible = false,
 			ZIndex = 7,
 			Parent = strip,
-		}, 14, 8)
+		}, 14, 7)
 		UIKit.stroke(UIKit.Colors.Border, 1, 0.5).Parent = chip
 		table.insert(chips, chip)
 	end
@@ -142,6 +155,22 @@ local function setChip(chip: TextLabel, text: string, color: Color3, strokeColor
 	UIKit.setVisible(chip, true)
 end
 
+-- One row for up to 4 chips, otherwise two wrapped rows.
+local function layoutChips(count: number)
+	local rows = if count <= 4 then 1 else 2
+	local perRow = math.max(1, math.ceil(count / rows))
+	if rows == chipRows and perRow == chipsPerRow then
+		return
+	end
+	chipRows, chipsPerRow = rows, perRow
+	grid.CellSize = UDim2.new(1 / perRow, -4, 0, if rows == 1 then 26 else 18)
+end
+
+local function chipName(userId: number, maxChars: number): string
+	local name = UIKit.escape(shorten(string.upper(State.nameOf(userId)), maxChars))
+	return if State.isBot(userId) then name .. AI_TAG else name
+end
+
 -- Rebuilds texts from the snapshot (called on snapshot change only).
 function GameHUD.update()
 	local snapshot = State.snapshot
@@ -154,31 +183,39 @@ function GameHUD.update()
 
 	local turn = snapshot.turn
 	local judging = snapshot.judging
-	local nowText
 	if snapshot.state == "JUDGING" and judging then
-		nowText = `{string.upper(State.nameOf(judging.userId))} SAID "{judging.answer}"`
-	elseif turn then
-		nowText = if turn.userId == State.localUserId
-			then "YOUR TURN - ANSWER NOW"
-			else `NOW ANSWERING: {string.upper(State.nameOf(turn.userId))}`
-	elseif snapshot.state == "COUNTDOWN" then
-		nowText = "LISTEN TO THE BEAT..."
+		-- The answer is "revealed": typed out with a short glitch.
+		TextFX.typeIfChanged(nowLabel, `{State.tagName(judging.userId)} SAID "{judging.answer}"`, { cps = 45, glitch = true })
 	else
-		nowText = ""
+		local nowText
+		if turn then
+			nowText = if turn.userId == State.localUserId
+				then "YOUR TURN - ANSWER NOW"
+				else `NOW ANSWERING: {State.tagName(turn.userId)}`
+		elseif snapshot.state == "COUNTDOWN" then
+			nowText = "LISTEN TO THE BEAT..."
+		else
+			nowText = ""
+		end
+		TextFX.cancel(nowLabel)
+		UIKit.setText(nowLabel, nowText)
 	end
-	UIKit.setText(nowLabel, nowText)
 
 	local currentId = if turn then turn.userId elseif judging then judging.userId else nil
+	local order: { number } = if type(snapshot.turnOrder) == "table" then snapshot.turnOrder else {}
+	local callerId = snapshot.callerUserId
+	local wanted = math.min(#order + (if callerId then 1 else 0), MAX_CHIPS)
+	layoutChips(wanted)
+	local maxChars = if chipRows > 1 then MAX_NAME_TWO_ROWS else MAX_NAME_ONE_ROW
 	local index = 0
-	local order: { number } = snapshot.turnOrder or {}
 	for _, userId in order do
-		index += 1
-		local chip = chips[index]
-		if not chip then
+		if index >= MAX_CHIPS - (if callerId then 1 else 0) then
 			break
 		end
+		index += 1
+		local chip = chips[index]
 		local player = State.playersById[userId]
-		local name = escape(string.upper(State.nameOf(userId)))
+		local name = chipName(userId, maxChars)
 		local out = player ~= nil and player.status ~= "Active"
 		if out then
 			setChip(chip, `<s>{name}</s>`, UIKit.Colors.Red, UIKit.Colors.RedDim, false)
@@ -188,11 +225,10 @@ function GameHUD.update()
 			setChip(chip, name, UIKit.Colors.Text, UIKit.Colors.Border, false)
 		end
 	end
-	local callerId = snapshot.callerUserId
-	if callerId and index < MAX_CHIPS then
+	if callerId then
 		index += 1
-		local name = escape(string.upper(State.nameOf(callerId)))
-		setChip(chips[index], `CALLER · {name}`, UIKit.Colors.Amber, UIKit.Colors.Amber, false)
+		local prefix = if chipRows > 1 then "" else "CALLER · "
+		setChip(chips[index], `{prefix}{chipName(callerId, maxChars)}`, UIKit.Colors.Amber, UIKit.Colors.Amber, false)
 	end
 	for i = index + 1, MAX_CHIPS do
 		UIKit.setVisible(chips[i], false)
@@ -235,7 +271,11 @@ function GameHUD.step()
 	if seconds ~= lastSeconds then
 		lastSeconds = seconds
 		timerLabel.Text = if seconds >= 0 then UIKit.clock(seconds) else ""
-		timerLabel.TextColor3 = if seconds >= 0 and seconds <= 2 then UIKit.Colors.Red else UIKit.Colors.Text
+		local urgent = seconds >= 0 and seconds <= 2
+		timerLabel.TextColor3 = if urgent then UIKit.Colors.Red else UIKit.Colors.Text
+		if urgent and seconds > 0 then
+			UIKit.pulse(timerLabel, 1.4, 0.35)
+		end
 	end
 
 	local fill = 0
